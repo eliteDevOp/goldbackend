@@ -713,9 +713,8 @@ class PreciousMetalsAPI {
         this.server = http.createServer((req, res) => {
             this.handleRequest(req, res);
         });
-        
-        this.server.listen(this.port, () => {
-            console.log(`🌐 REST API Server running on http://localhost:${this.port}`);
+  this.server.listen(this.port, '0.0.0.0', () => {
+  console.log(`🌐 REST API Server running on http://0.0.0.0:${this.port}`);
             console.log(`📡 Available endpoints:`);
             console.log(`   GET  /api/prices - Get all metal prices`);
             console.log(`   GET  /api/prices/{metal} - Get specific metal price`);
