@@ -1,0 +1,18 @@
+{
+  "name": "backendgoldapp",
+  "version": "1.0.0",
+  "description": "backend for apps",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "bilal",
+  "license": "ISC",
+  "dependencies": {
+    "dotenv": "^17.2.0",
+    "express": "^5.1.0",
+    "sqlite3": "^5.1.7",
+    "ws": "^8.18.3"
+  },
+  "keywords": []
+}
