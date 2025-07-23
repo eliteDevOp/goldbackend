@@ -171,6 +171,183 @@ app.get('/api/health', (req, res) => {
     });
 });
 
+// ========== SIGNALS ROUTES ==========
+
+// Get all signals
+app.get('/api/signals', (req, res) => {
+    db.all(`
+        SELECT * FROM signals 
+        ORDER BY created_at DESC
+    `, [], (err, rows) => {
+        if (err) {
+            console.error('❌ Database error:', err);
+            return res.status(500).json({ error: 'Database error' });
+        }
+
+        logWithTimestamp(`📋 Retrieved ${rows.length} signals`);
+        res.json({
+            success: true,
+            signals: rows,
+            count: rows.length,
+            timestamp: new Date().toISOString()
+        });
+    });
+});
+
+// Add a new signal
+app.post('/api/signals', (req, res) => {
+    const {
+        symbol,
+        trade_type,
+        entry_price,
+        target1,
+        target2,
+        target3,
+        stoploss,
+        send_notifications
+    } = req.body;
+
+    // Validation
+    if (!symbol || !trade_type || !entry_price || !stoploss) {
+        return res.status(400).json({
+            error: 'Missing required fields: symbol, trade_type, entry_price, stoploss'
+        });
+    }
+
+    logWithTimestamp(`📤 Adding new signal: ${symbol} ${trade_type} at ${entry_price}`);
+
+    db.run(`
+        INSERT INTO signals (
+            symbol, trade_type, entry_price, target1, target2, target3, 
+            stoploss, send_notifications, current_price, percentage_change
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `, [
+        symbol,
+        trade_type,
+        entry_price,
+        target1 || null,
+        target2 || null,
+        target3 || null,
+        stoploss,
+        send_notifications !== false,
+        entry_price, // Initialize current_price with entry_price
+        0.0 // Initialize percentage_change
+    ], function(err) {
+        if (err) {
+            console.error('❌ Error adding signal:', err);
+            return res.status(500).json({ error: 'Failed to add signal' });
+        }
+
+        logWithTimestamp(`✅ Signal added successfully with ID: ${this.lastID}`);
+        res.json({
+            success: true,
+            message: 'Signal added successfully',
+            signal_id: this.lastID,
+            timestamp: new Date().toISOString()
+        });
+    });
+});
+
+// Update a signal
+app.put('/api/signals/:id', (req, res) => {
+    const signalId = req.params.id;
+    const {
+        target1_hit,
+        target2_hit,
+        target3_hit,
+        active,
+        current_price,
+        percentage_change
+    } = req.body;
+
+    logWithTimestamp(`📝 Updating signal ${signalId}`);
+
+    db.run(`
+        UPDATE signals SET
+            target1_hit = COALESCE(?, target1_hit),
+            target2_hit = COALESCE(?, target2_hit),
+            target3_hit = COALESCE(?, target3_hit),
+            active = COALESCE(?, active),
+            current_price = COALESCE(?, current_price),
+            percentage_change = COALESCE(?, percentage_change),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+    `, [
+        target1_hit,
+        target2_hit,
+        target3_hit,
+        active,
+        current_price,
+        percentage_change,
+        signalId
+    ], function(err) {
+        if (err) {
+            console.error('❌ Error updating signal:', err);
+            return res.status(500).json({ error: 'Failed to update signal' });
+        }
+
+        if (this.changes === 0) {
+            return res.status(404).json({ error: 'Signal not found' });
+        }
+
+        logWithTimestamp(`✅ Signal ${signalId} updated successfully`);
+        res.json({
+            success: true,
+            message: 'Signal updated successfully',
+            changes: this.changes,
+            timestamp: new Date().toISOString()
+        });
+    });
+});
+
+// Delete a signal
+app.delete('/api/signals/:id', (req, res) => {
+    const signalId = req.params.id;
+
+    logWithTimestamp(`🗑️ Deleting signal ${signalId}`);
+
+    db.run('DELETE FROM signals WHERE id = ?', [signalId], function(err) {
+        if (err) {
+            console.error('❌ Error deleting signal:', err);
+            return res.status(500).json({ error: 'Failed to delete signal' });
+        }
+
+        if (this.changes === 0) {
+            return res.status(404).json({ error: 'Signal not found' });
+        }
+
+        logWithTimestamp(`✅ Signal ${signalId} deleted successfully`);
+        res.json({
+            success: true,
+            message: 'Signal deleted successfully',
+            changes: this.changes,
+            timestamp: new Date().toISOString()
+        });
+    });
+});
+
+// Get a specific signal
+app.get('/api/signals/:id', (req, res) => {
+    const signalId = req.params.id;
+
+    db.get('SELECT * FROM signals WHERE id = ?', [signalId], (err, row) => {
+        if (err) {
+            console.error('❌ Database error:', err);
+            return res.status(500).json({ error: 'Database error' });
+        }
+
+        if (!row) {
+            return res.status(404).json({ error: 'Signal not found' });
+        }
+
+        res.json({
+            success: true,
+            signal: row,
+            timestamp: new Date().toISOString()
+        });
+    });
+});
+
 // ========== START SERVER ==========
 app.listen(PORT, '0.0.0.0', () => {
     console.log('🚀 Enhanced Gold Tracker API Server Started');
@@ -179,6 +356,12 @@ app.listen(PORT, '0.0.0.0', () => {
     console.log('   📊 Prices:');
     console.log('      GET  /api/prices - Get all metal prices');
     console.log('      GET  /api/metals/{symbol}/price - Get specific metal price');
+    console.log('   📈 Signals:');
+    console.log('      GET  /api/signals - Get all signals');
+    console.log('      POST /api/signals - Add new signal');
+    console.log('      PUT  /api/signals/{id} - Update signal');
+    console.log('      DELETE /api/signals/{id} - Delete signal');
+    console.log('      GET  /api/signals/{id} - Get specific signal');
     console.log('   🔧 System:');
     console.log('      GET  /api/health - Health check');
 });
