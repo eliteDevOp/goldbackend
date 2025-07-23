@@ -1,777 +1,504 @@
-const https = require('https');
-const http = require('http');
-const url = require('url');
+const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
+const axios = require('axios');
+const cors = require('cors');
 const path = require('path');
 
-class DatabasePreciousMetalsTracker {
-    constructor(apiKey, dbPath = './precious_metals.db') {
-        this.apiKey = apiKey;
-        this.baseUrl = 'https://api.polygon.io';
-        this.dbPath = dbPath;
-        this.db = null;
-        this.refreshInterval = 30000; // Start with 30 seconds (more reasonable)
-        this.maxRefreshInterval = 300000; // Max 5 minutes
-        this.minRefreshInterval = 30000; // Min 30 seconds
-        this.intervalId = null;
-        this.consecutiveNoUpdates = 0;
-        this.lastApiCheck = null;
-        this.consecutiveErrors = 0;
-        this.maxConsecutiveErrors = 5;
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Middleware
+app.use(cors());
+app.use(express.json());
+
+// Database setup
+const dbPath = path.join(__dirname, 'gold_tracker.db');
+const db = new sqlite3.Database(dbPath);
+
+// Initialize database tables
+db.serialize(() => {
+    // Existing prices table
+    db.run(`CREATE TABLE IF NOT EXISTS prices (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        metal TEXT UNIQUE NOT NULL,
+        price REAL NOT NULL,
+        change_24h REAL,
+        change_percent REAL,
+        last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+
+    // New signals table
+    db.run(`CREATE TABLE IF NOT EXISTS signals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT NOT NULL,
+        trade_type TEXT NOT NULL,
+        entry_price REAL NOT NULL,
+        current_price REAL,
+        percentage_change REAL DEFAULT 0.0,
+        target1 REAL,
+        target2 REAL,
+        target3 REAL,
+        target1_hit BOOLEAN DEFAULT 0,
+        target2_hit BOOLEAN DEFAULT 0,
+        target3_hit BOOLEAN DEFAULT 0,
+        stoploss REAL NOT NULL,
+        active BOOLEAN DEFAULT 1,
+        send_notifications BOOLEAN DEFAULT 1,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+
+    // Users table for notification management
+    db.run(`CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        device_token TEXT UNIQUE,
+        platform TEXT,
+        subscribed BOOLEAN DEFAULT 1,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+});
+
+// API Configuration
+const POLYGON_API_KEY = 'i4wKSoyGcr94hGIydnBO3SjpOO1YKD1O'; // Replace with your API key
+const metals = {
+    'XAU': 'C:XAUUSD', // Gold
+    'XAG': 'C:XAGUSD', // Silver
+    'XPT': 'C:XPTUSD', // Platinum
+    'XPD': 'C:XPDUSD'  // Palladium
+};
+
+// Cache for prices
+let priceCache = {};
+let lastApiCall = {};
+
+// Helper functions
+function logWithTimestamp(message) {
+    const now = new Date();
+    const timestamp = now.toLocaleTimeString();
+    console.log(`${message} (${timestamp})`);
+}
+
+async function fetchMetalPrice(metalSymbol) {
+    try {
+        const ticker = metals[metalSymbol];
+        if (!ticker) {
+            throw new Error(`Unsupported metal symbol: ${metalSymbol}`);
+        }
+
+        logWithTimestamp(`📡 Fetching price for ${metalSymbol}`);
         
-        // Precious metals symbols for forex pairs
-        this.symbols = {
-            'C:XAUUSD': 'Gold',
-            'C:XAGUSD': 'Silver',
-            'C:XPTUSD': 'Platinum', 
-            'C:XPDUSD': 'Palladium'
-        };
-        
-        // Cache for current prices (in-memory for fast access)
-        this.priceCache = {};
-        
-        console.log('🚀 Starting Database-Backed Precious Metals Tracker...');
-        console.log('💾 Using SQLite database for persistent storage');
-        console.log('📡 Smart API polling - only updates on price changes');
-        console.log('💎 Tracking: Gold, Silver, Platinum, Palladium\n');
-        
-        this.initializeDatabase();
-    }
-    
-    // Initialize SQLite database
-    initializeDatabase() {
-        return new Promise((resolve, reject) => {
-            this.db = new sqlite3.Database(this.dbPath, (err) => {
-                if (err) {
-                    console.error('❌ Error opening database:', err.message);
-                    reject(err);
-                    return;
-                }
-                
-                console.log('📊 Connected to SQLite database');
-                this.createTables().then(() => {
-                    this.loadCacheFromDatabase().then(() => {
-                        console.log('💾 Price cache loaded from database');
-                        this.start();
-                        resolve();
-                    });
-                }).catch(reject);
-            });
+        const response = await axios.get(`https://api.polygon.io/v2/aggs/ticker/${ticker}/prev`, {
+            params: {
+                adjusted: 'true',
+                apikey: POLYGON_API_KEY
+            }
         });
-    }
-    
-    // Create necessary tables
-    createTables() {
-        return new Promise((resolve, reject) => {
-            const createPricesTable = `
-                CREATE TABLE IF NOT EXISTS prices (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol TEXT NOT NULL,
-                    metal_name TEXT NOT NULL,
-                    bid REAL,
-                    ask REAL,
-                    mid_price REAL,
-                    spread REAL,
-                    prev_close REAL,
-                    daily_change REAL,
-                    daily_change_percent REAL,
-                    day_high REAL,
-                    day_low REAL,
-                    volume INTEGER,
-                    quote_timestamp INTEGER,
-                    prev_close_timestamp INTEGER,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            `;
-            
-            const createMetadataTable = `
-                CREATE TABLE IF NOT EXISTS metadata (
-                    key TEXT PRIMARY KEY,
-                    value TEXT,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            `;
-            
-            this.db.run(createPricesTable, (err) => {
-                if (err) {
-                    console.error('❌ Error creating prices table:', err.message);
-                    reject(err);
-                    return;
-                }
-                
-                this.db.run(createMetadataTable, (err) => {
-                    if (err) {
-                        console.error('❌ Error creating metadata table:', err.message);
-                        reject(err);
-                        return;
-                    }
-                    
-                    console.log('✅ Database tables initialized');
-                    resolve();
-                });
-            });
-        });
-    }
-    
-    // Load current prices from database into cache
-    loadCacheFromDatabase() {
-        return new Promise((resolve, reject) => {
-            const query = `
-                SELECT * FROM prices 
-                WHERE symbol IN (?, ?, ?, ?)
-                ORDER BY updated_at DESC
-            `;
-            
-            this.db.all(query, Object.keys(this.symbols), (err, rows) => {
-                if (err) {
-                    console.error('❌ Error loading cache from database:', err.message);
-                    reject(err);
-                    return;
-                }
-                
-                // Load latest price for each symbol
-                const latestPrices = {};
-                rows.forEach(row => {
-                    if (!latestPrices[row.symbol]) {
-                        latestPrices[row.symbol] = row;
-                    }
-                });
-                
-                // Populate cache
-                Object.keys(this.symbols).forEach(symbol => {
-                    if (latestPrices[symbol]) {
-                        this.priceCache[symbol] = this.formatPriceData(latestPrices[symbol]);
-                    }
-                });
-                
-                console.log(`💾 Loaded ${Object.keys(this.priceCache).length} prices from database`);
-                resolve();
-            });
-        });
-    }
-    
-    // Format database row to price data structure
-    formatPriceData(row) {
-        return {
-            name: row.metal_name,
-            symbol: row.symbol,
-            quote: row.bid && row.ask ? {
-                bid: row.bid,
-                ask: row.ask,
-                timestamp: row.quote_timestamp
-            } : null,
-            prevClose: row.prev_close ? {
-                c: row.prev_close,
-                o: row.prev_close - (row.daily_change || 0),
-                h: row.day_high,
-                l: row.day_low,
-                v: row.volume,
-                t: row.prev_close_timestamp
-            } : null,
-            midPrice: row.mid_price,
-            spread: row.spread,
-            dailyChange: row.daily_change,
-            dailyChangePercent: row.daily_change_percent,
-            lastUpdated: new Date(row.updated_at),
-            fromDatabase: true
-        };
-    }
-    
-    // Make HTTP request to Polygon.io API with better error handling
-    makeRequest(endpoint) {
-        return new Promise((resolve, reject) => {
-            const requestUrl = `${this.baseUrl}${endpoint}`;
-            const urlWithKey = `${requestUrl}${requestUrl.includes('?') ? '&' : '?'}apikey=${this.apiKey}`;
-            
-            const options = {
-                timeout: 15000, // Increased timeout to 15 seconds
-                headers: {
-                    'User-Agent': 'PreciousMetalsTracker/1.0',
-                    'Accept': 'application/json',
-                    'Content-Type': 'application/json'
-                }
+
+        if (response.data && response.data.results && response.data.results.length > 0) {
+            const result = response.data.results[0];
+            return {
+                price: result.c, // Close price
+                change: result.c - result.o, // Change from open
+                changePercent: ((result.c - result.o) / result.o) * 100
             };
-            
-            const req = https.get(urlWithKey, options, (response) => {
-                let data = '';
-                
-                response.on('data', (chunk) => {
-                    data += chunk;
-                });
-                
-                response.on('end', () => {
-                    try {
-                        // Log the first few characters for debugging
-                        console.log(`📡 API Response Preview: ${data.substring(0, 100)}...`);
-                        
-                        // Check if response is HTML (error page)
-                        if (data.trim().startsWith('<') || data.trim().startsWith('<!')) {
-                            console.log('❌ Received HTML response - likely rate limited or API error');
-                            reject(new Error('Received HTML response instead of JSON (likely rate limited or API error)'));
-                            return;
-                        }
-                        
-                        // Check if response is empty
-                        if (!data.trim()) {
-                            console.log('❌ Empty response from API');
-                            reject(new Error('Empty response from API'));
-                            return;
-                        }
-                        
-                        // Check for common error patterns
-                        if (data.includes('Too Many Requests') || data.includes('Rate limit')) {
-                            console.log('❌ Rate limit detected');
-                            reject(new Error('API rate limit exceeded'));
-                            return;
-                        }
-                        
-                        // Try to parse JSON
-                        let jsonData;
-                        try {
-                            jsonData = JSON.parse(data);
-                        } catch (parseError) {
-                            console.log('❌ JSON parse error:', parseError.message);
-                            console.log('❌ Raw response:', data.substring(0, 500));
-                            reject(new Error(`JSON Parse Error: ${parseError.message}`));
-                            return;
-                        }
-                        
-                        // Check API response status
-                        if (response.statusCode !== 200) {
-                            console.log(`❌ HTTP ${response.statusCode}:`, jsonData.error || 'Unknown error');
-                            reject(new Error(`HTTP ${response.statusCode}: ${jsonData.error || 'Unknown error'}`));
-                            return;
-                        }
-                        
-                        if (jsonData.status === 'OK') {
-                            resolve(jsonData);
-                        } else if (jsonData.status === 'ERROR') {
-                            console.log('❌ API Error:', jsonData.error || 'Unknown error');
-                            reject(new Error(`API Error: ${jsonData.error || 'Unknown error'}`));
-                        } else {
-                            console.log('❌ Unexpected API status:', jsonData.status);
-                            reject(new Error(`Unexpected API status: ${jsonData.status}`));
-                        }
-                    } catch (error) {
-                        console.log('❌ Error processing response:', error.message);
-                        reject(new Error(`Response processing error: ${error.message}`));
-                    }
-                });
-            });
-            
-            req.on('error', (error) => {
-                console.log('❌ Request error:', error.message);
-                reject(new Error(`Request Error: ${error.message}`));
-            });
-            
-            req.on('timeout', () => {
-                console.log('❌ Request timeout');
-                req.destroy();
-                reject(new Error('Request timeout'));
-            });
-        });
-    }
-    
-    // Get real-time quotes for a single symbol - DISABLED to avoid null values
-    async getRealTimeQuote(symbol) {
-        console.log(`⏭️ Skipping real-time quote for ${symbol} (disabled to avoid null values)`);
-        return null; // Always return null to skip bid/ask/spread
-    }
-    
-    // Get previous day's closing data
-    async getPreviousClose(symbol) {
-        try {
-            const endpoint = `/v2/aggs/ticker/${symbol}/prev`;
-            console.log(`📡 Fetching previous close for ${symbol}`);
-            const data = await this.makeRequest(endpoint);
-            return data.results && data.results.length > 0 ? data.results[0] : null;
-        } catch (error) {
-            console.error(`❌ Error fetching previous close for ${symbol}:`, error.message);
-            return null;
-        }
-    }
-    
-    // Save price data to database
-    savePriceToDatabase(symbol, quote, prevClose) {
-        return new Promise((resolve, reject) => {
-            const metalName = this.symbols[symbol];
-            const midPrice = quote && quote.bid && quote.ask ? (quote.bid + quote.ask) / 2 : null;
-            const spread = quote && quote.bid && quote.ask ? quote.ask - quote.bid : null;
-            const dailyChange = prevClose && prevClose.c && prevClose.o ? prevClose.c - prevClose.o : null;
-            const dailyChangePercent = prevClose && prevClose.c && prevClose.o ? 
-                ((prevClose.c - prevClose.o) / prevClose.o) * 100 : null;
-            
-            const insertQuery = `
-                INSERT INTO prices (
-                    symbol, metal_name, bid, ask, mid_price, spread,
-                    prev_close, daily_change, daily_change_percent,
-                    day_high, day_low, volume, quote_timestamp, prev_close_timestamp
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            `;
-            
-            const params = [
-                symbol,
-                metalName,
-                quote?.bid || null,
-                quote?.ask || null,
-                midPrice,
-                spread,
-                prevClose?.c || null,
-                dailyChange,
-                dailyChangePercent,
-                prevClose?.h || null,
-                prevClose?.l || null,
-                prevClose?.v || null,
-                quote?.timestamp || null,
-                prevClose?.t || null
-            ];
-            
-            this.db.run(insertQuery, params, function(err) {
-                if (err) {
-                    console.error('❌ Error saving to database:', err.message);
-                    reject(err);
-                    return;
-                }
-                
-                console.log(`💾 Saved ${metalName} price to database (ID: ${this.lastID})`);
-                resolve(this.lastID);
-            });
-        });
-    }
-    
-    // Check if price has changed significantly
-    hasPriceChanged(symbol, newQuote, newPrevClose) {
-        const cached = this.priceCache[symbol];
-        
-        if (!cached) return true; // No cached data, consider it changed
-        
-        // Check quote changes (should be rare since we're not fetching quotes)
-        if (newQuote && cached.quote) {
-            const bidChanged = Math.abs((newQuote.bid || 0) - (cached.quote.bid || 0)) > 0.01;
-            const askChanged = Math.abs((newQuote.ask || 0) - (cached.quote.ask || 0)) > 0.01;
-            if (bidChanged || askChanged) return true;
-        }
-        
-        // Check previous close changes
-        if (newPrevClose && cached.prevClose) {
-            const closeChanged = Math.abs((newPrevClose.c || 0) - (cached.prevClose.c || 0)) > 0.01;
-            if (closeChanged) return true;
-        }
-        
-        // Check if we have new data where we had none before
-        if ((newQuote && !cached.quote) || (newPrevClose && !cached.prevClose)) {
-            return true;
-        }
-        
-        return false;
-    }
-    
-    // Update price cache
-    updatePriceCache(symbol, quote, prevClose) {
-        const metalName = this.symbols[symbol];
-        const midPrice = quote && quote.bid && quote.ask ? (quote.bid + quote.ask) / 2 : null;
-        const spread = quote && quote.bid && quote.ask ? quote.ask - quote.bid : null;
-        const dailyChange = prevClose && prevClose.c && prevClose.o ? prevClose.c - prevClose.o : null;
-        const dailyChangePercent = prevClose && prevClose.c && prevClose.o ? 
-            ((prevClose.c - prevClose.o) / prevClose.o) * 100 : null;
-        
-        this.priceCache[symbol] = {
-            name: metalName,
-            symbol: symbol,
-            quote: quote,
-            prevClose: prevClose,
-            midPrice: midPrice,
-            spread: spread,
-            dailyChange: dailyChange,
-            dailyChangePercent: dailyChangePercent,
-            lastUpdated: new Date(),
-            fromDatabase: false
-        };
-    }
-    
-    // Smart price checking with database storage
-    async checkAndUpdatePrices() {
-        console.log(`🔍 Checking API for price updates... (${new Date().toLocaleTimeString()})`);
-        
-        let totalUpdates = 0;
-        let apiCallsMade = 0;
-        let errors = 0;
-        
-        for (const symbol of Object.keys(this.symbols)) {
-            const metalName = this.symbols[symbol];
-            
-            try {
-                // Add delay between API calls to avoid rate limiting
-                if (apiCallsMade > 0) {
-                    await new Promise(resolve => setTimeout(resolve, 2000)); // Increased delay to 2 seconds
-                }
-                
-                // Skip real-time quotes to avoid null values and API errors
-                const quote = null;
-                
-                // Only fetch previous close data
-                const prevClose = await this.getPreviousClose(symbol);
-                apiCallsMade++;
-                
-                // Check if we got any data
-                if (!prevClose) {
-                    console.log(`⚠️ No previous close data received for ${metalName}`);
-                    errors++;
-                    continue;
-                }
-                
-                // Check if price has changed
-                const hasChanged = this.hasPriceChanged(symbol, quote, prevClose);
-                
-                if (hasChanged) {
-                    // Save to database
-                    await this.savePriceToDatabase(symbol, quote, prevClose);
-                    
-                    // Update cache
-                    this.updatePriceCache(symbol, quote, prevClose);
-                    
-                    totalUpdates++;
-                    console.log(`📈 ${metalName} price updated and saved to database`);
-                } else {
-                    console.log(`➡️ ${metalName} price unchanged`);
-                }
-                
-            } catch (error) {
-                console.error(`❌ Error processing ${metalName}:`, error.message);
-                errors++;
-            }
-        }
-        
-        console.log(`📊 API calls: ${apiCallsMade} | Updates: ${totalUpdates}/${Object.keys(this.symbols).length} | Errors: ${errors}`);
-        
-        // Handle consecutive errors
-        if (errors >= Object.keys(this.symbols).length) {
-            this.consecutiveErrors++;
-            console.warn(`⚠️ All symbols failed (${this.consecutiveErrors}/${this.maxConsecutiveErrors})`);
-            
-            if (this.consecutiveErrors >= this.maxConsecutiveErrors) {
-                console.error('❌ Too many consecutive errors, increasing polling interval');
-                this.refreshInterval = Math.min(this.maxRefreshInterval, this.refreshInterval * 2);
-                this.restartInterval();
-            }
         } else {
-            this.consecutiveErrors = 0;
+            throw new Error('No price data available');
         }
-        
-        // Adjust polling frequency based on updates
-        this.adjustPollingFrequency(totalUpdates > 0);
-        
-        return totalUpdates;
-    }
-    
-    // Adjust polling frequency based on activity
-    adjustPollingFrequency(hasUpdates) {
-        if (hasUpdates) {
-            this.consecutiveNoUpdates = 0;
-            // Increase frequency when there are updates (but not too aggressively)
-            this.refreshInterval = Math.max(this.minRefreshInterval, this.refreshInterval * 0.95);
-        } else {
-            this.consecutiveNoUpdates++;
-            // Decrease frequency when no updates
-            if (this.consecutiveNoUpdates >= 2) {
-                this.refreshInterval = Math.min(this.maxRefreshInterval, this.refreshInterval * 1.2);
-            }
-        }
-        
-        // Restart interval with new timing
-        this.restartInterval();
-    }
-    
-    // Restart the polling interval
-    restartInterval() {
-        if (this.intervalId) {
-            clearInterval(this.intervalId);
-        }
-        
-        this.intervalId = setInterval(() => {
-            this.checkAndUpdatePrices();
-        }, this.refreshInterval);
-    }
-    
-    // Start the tracking system
-    start() {
-        console.log('🚀 Starting database-backed price tracking...');
-        
-        // Start periodic API checking
-        this.checkAndUpdatePrices();
-        
-        console.log(`🔄 Started smart polling with ${this.refreshInterval/1000}s interval`);
-    }
-    
-    // Stop the tracking system
-    stop() {
-        if (this.intervalId) {
-            clearInterval(this.intervalId);
-            this.intervalId = null;
-        }
-        
-        if (this.db) {
-            this.db.close((err) => {
-                if (err) {
-                    console.error('❌ Error closing database:', err.message);
-                } else {
-                    console.log('💾 Database connection closed');
-                }
-            });
-        }
-        
-        console.log('🛑 Stopped price tracking');
-    }
-    
-    // Get all current prices for API - with null handling and cleaned response
-    getAllCurrentPrices() {
-        const formattedPrices = {};
-        
-        Object.keys(this.symbols).forEach(symbol => {
-            const data = this.priceCache[symbol];
-            if (data) {
-                const priceData = {
-                    name: data.name,
-                    symbol: data.symbol,
-                    // Use previous close as current price
-                    currentPrice: data.prevClose?.c || null,
-                    previousClose: data.prevClose?.c || null,
-                    dailyChange: data.dailyChange || null,
-                    dailyChangePercent: data.dailyChangePercent || null,
-                    dayHigh: data.prevClose?.h || null,
-                    dayLow: data.prevClose?.l || null,
-                    volume: data.prevClose?.v || null,
-                    lastUpdated: data.lastUpdated,
-                    fromDatabase: data.fromDatabase,
-                    status: 'historical' // Since we're not fetching live quotes
-                };
-                
-                // Remove null values from the response
-                Object.keys(priceData).forEach(key => {
-                    if (priceData[key] === null) {
-                        delete priceData[key];
-                    }
-                });
-                
-                formattedPrices[data.name.toLowerCase()] = priceData;
-            }
-        });
-        
-        return formattedPrices;
-    }
-    
-    // Get specific metal price
-    getMetalPrice(metalName) {
-        const prices = this.getAllCurrentPrices();
-        return prices[metalName.toLowerCase()] || null;
-    }
-    
-    // Force refresh from API
-    async forceRefresh() {
-        console.log('🔄 Manual refresh triggered...');
-        return await this.checkAndUpdatePrices();
-    }
-    
-    // Get API status
-    getAPIStatus() {
-        return {
-            connected: this.db !== null,
-            lastCheck: this.lastApiCheck,
-            refreshInterval: this.refreshInterval,
-            consecutiveErrors: this.consecutiveErrors,
-            cachedPrices: Object.keys(this.priceCache).length
-        };
+    } catch (error) {
+        console.error(`❌ Error fetching ${metalSymbol} price:`, error.message);
+        throw error;
     }
 }
 
-// REST API Server
-class PreciousMetalsAPI {
-    constructor(tracker, port = 3000) {
-        this.tracker = tracker;
-        this.port = port;
-        this.server = null;
+// Signal API Endpoints
+
+// Get all signals
+app.get('/api/signals', (req, res) => {
+    const { active, limit = 50, offset = 0 } = req.query;
+    
+    let query = 'SELECT * FROM signals';
+    let params = [];
+    
+    if (active !== undefined) {
+        query += ' WHERE active = ?';
+        params.push(active === 'true' ? 1 : 0);
     }
     
-    // Handle CORS
-    setCORSHeaders(res) {
-        res.setHeader('Access-Control-Allow-Origin', '*');
-        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-    }
+    query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
+    params.push(parseInt(limit), parseInt(offset));
     
-    // Send JSON response
-    sendJSON(res, data, statusCode = 200) {
-        this.setCORSHeaders(res);
-        res.writeHead(statusCode, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(data, null, 2));
-    }
-    
-    // Handle API requests
-    async handleRequest(req, res) {
-        this.setCORSHeaders(res);
+    db.all(query, params, (err, rows) => {
+        if (err) {
+            console.error('❌ Error fetching signals:', err);
+            return res.status(500).json({ error: 'Failed to fetch signals' });
+        }
         
-        // Handle preflight OPTIONS requests
-        if (req.method === 'OPTIONS') {
-            res.writeHead(200);
-            res.end();
+        // Convert boolean fields
+        const signals = rows.map(row => ({
+            ...row,
+            target1_hit: Boolean(row.target1_hit),
+            target2_hit: Boolean(row.target2_hit),
+            target3_hit: Boolean(row.target3_hit),
+            active: Boolean(row.active),
+            send_notifications: Boolean(row.send_notifications)
+        }));
+        
+        res.json({
+            success: true,
+            signals,
+            count: signals.length
+        });
+    });
+});
+
+// Get signal by ID
+app.get('/api/signals/:id', (req, res) => {
+    const { id } = req.params;
+    
+    db.get('SELECT * FROM signals WHERE id = ?', [id], (err, row) => {
+        if (err) {
+            console.error('❌ Error fetching signal:', err);
+            return res.status(500).json({ error: 'Failed to fetch signal' });
+        }
+        
+        if (!row) {
+            return res.status(404).json({ error: 'Signal not found' });
+        }
+        
+        // Convert boolean fields
+        const signal = {
+            ...row,
+            target1_hit: Boolean(row.target1_hit),
+            target2_hit: Boolean(row.target2_hit),
+            target3_hit: Boolean(row.target3_hit),
+            active: Boolean(row.active),
+            send_notifications: Boolean(row.send_notifications)
+        };
+        
+        res.json({
+            success: true,
+            signal
+        });
+    });
+});
+
+// Create new signal
+app.post('/api/signals', async (req, res) => {
+    try {
+        const {
+            symbol,
+            trade_type,
+            entry_price,
+            target1,
+            target2,
+            target3,
+            stoploss,
+            send_notifications = true
+        } = req.body;
+
+        // Validation
+        if (!symbol || !trade_type || !entry_price || !stoploss) {
+            return res.status(400).json({
+                error: 'Missing required fields: symbol, trade_type, entry_price, stoploss'
+            });
+        }
+
+        if (!['BUY', 'SELL'].includes(trade_type.toUpperCase())) {
+            return res.status(400).json({
+                error: 'trade_type must be either BUY or SELL'
+            });
+        }
+
+        if (!metals[symbol]) {
+            return res.status(400).json({
+                error: 'Invalid symbol. Supported symbols: XAU, XAG, XPT, XPD'
+            });
+        }
+
+        // Get current price
+        let current_price = entry_price;
+        try {
+            const priceData = await fetchMetalPrice(symbol);
+            current_price = priceData.price;
+        } catch (error) {
+            console.warn('⚠️ Could not fetch current price, using entry price');
+        }
+
+        // Calculate percentage change
+        const percentage_change = ((current_price - entry_price) / entry_price) * 100;
+
+        const query = `
+            INSERT INTO signals (
+                symbol, trade_type, entry_price, current_price, percentage_change,
+                target1, target2, target3, stoploss, send_notifications
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `;
+
+        const params = [
+            symbol,
+            trade_type.toUpperCase(),
+            entry_price,
+            current_price,
+            percentage_change,
+            target1 || null,
+            target2 || null,
+            target3 || null,
+            stoploss,
+            send_notifications ? 1 : 0
+        ];
+
+        db.run(query, params, function(err) {
+            if (err) {
+                console.error('❌ Error creating signal:', err);
+                return res.status(500).json({ error: 'Failed to create signal' });
+            }
+
+            logWithTimestamp(`✅ New signal created: ${symbol} ${trade_type} at ${entry_price}`);
+
+            // Send notification if enabled
+            if (send_notifications) {
+                sendSignalNotification({
+                    id: this.lastID,
+                    symbol,
+                    trade_type,
+                    entry_price,
+                    current_price
+                });
+            }
+
+            res.status(201).json({
+                success: true,
+                signal_id: this.lastID,
+                message: 'Signal created successfully'
+            });
+        });
+
+    } catch (error) {
+        console.error('❌ Error in signal creation:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Update signal
+app.put('/api/signals/:id', (req, res) => {
+    const { id } = req.params;
+    const updates = req.body;
+    
+    // Build dynamic update query
+    const allowedFields = [
+        'target1_hit', 'target2_hit', 'target3_hit', 'active', 
+        'current_price', 'percentage_change'
+    ];
+    
+    const updateFields = [];
+    const params = [];
+    
+    Object.keys(updates).forEach(key => {
+        if (allowedFields.includes(key)) {
+            updateFields.push(`${key} = ?`);
+            params.push(updates[key]);
+        }
+    });
+    
+    if (updateFields.length === 0) {
+        return res.status(400).json({ error: 'No valid fields to update' });
+    }
+    
+    updateFields.push('updated_at = CURRENT_TIMESTAMP');
+    params.push(id);
+    
+    const query = `UPDATE signals SET ${updateFields.join(', ')} WHERE id = ?`;
+    
+    db.run(query, params, function(err) {
+        if (err) {
+            console.error('❌ Error updating signal:', err);
+            return res.status(500).json({ error: 'Failed to update signal' });
+        }
+        
+        if (this.changes === 0) {
+            return res.status(404).json({ error: 'Signal not found' });
+        }
+        
+        res.json({
+            success: true,
+            message: 'Signal updated successfully'
+        });
+    });
+});
+
+// Delete signal
+app.delete('/api/signals/:id', (req, res) => {
+    const { id } = req.params;
+    
+    db.run('DELETE FROM signals WHERE id = ?', [id], function(err) {
+        if (err) {
+            console.error('❌ Error deleting signal:', err);
+            return res.status(500).json({ error: 'Failed to delete signal' });
+        }
+        
+        if (this.changes === 0) {
+            return res.status(404).json({ error: 'Signal not found' });
+        }
+        
+        res.json({
+            success: true,
+            message: 'Signal deleted successfully'
+        });
+    });
+});
+
+// Get current metal price
+app.get('/api/metals/:symbol/price', async (req, res) => {
+    try {
+        const { symbol } = req.params;
+        
+        if (!metals[symbol]) {
+            return res.status(400).json({
+                error: 'Invalid symbol. Supported symbols: XAU, XAG, XPT, XPD'
+            });
+        }
+        
+        const priceData = await fetchMetalPrice(symbol);
+        
+        res.json({
+            success: true,
+            symbol,
+            ...priceData,
+            timestamp: new Date().toISOString()
+        });
+        
+    } catch (error) {
+        res.status(500).json({
+            error: 'Failed to fetch price',
+            message: error.message
+        });
+    }
+});
+
+// User management endpoints
+app.post('/api/users/register', (req, res) => {
+    const { device_token, platform = 'android' } = req.body;
+    
+    if (!device_token) {
+        return res.status(400).json({ error: 'device_token is required' });
+    }
+    
+    const query = `
+        INSERT OR REPLACE INTO users (device_token, platform, subscribed)
+        VALUES (?, ?, 1)
+    `;
+    
+    db.run(query, [device_token, platform], function(err) {
+        if (err) {
+            console.error('❌ Error registering user:', err);
+            return res.status(500).json({ error: 'Failed to register user' });
+        }
+        
+        res.json({
+            success: true,
+            message: 'User registered successfully'
+        });
+    });
+});
+
+// Notification helper function
+function sendSignalNotification(signal) {
+    // Get all subscribed users
+    db.all('SELECT device_token FROM users WHERE subscribed = 1', [], (err, users) => {
+        if (err) {
+            console.error('❌ Error fetching users for notification:', err);
             return;
         }
         
-        const parsedUrl = url.parse(req.url, true);
-        const path = parsedUrl.pathname;
-        const method = req.method;
+        if (users.length === 0) {
+            console.log('📱 No users to notify');
+            return;
+        }
         
-        console.log(`📡 API Request: ${method} ${path}`);
-        
-        try {
-            // Route handling
-            if (path === '/api/prices' && method === 'GET') {
-                // Get all current prices
-                const prices = this.tracker.getAllCurrentPrices();
-                this.sendJSON(res, {
-                    success: true,
-                    data: prices,
-                    timestamp: new Date().toISOString(),
-                    count: Object.keys(prices).length,
-                    apiStatus: this.tracker.getAPIStatus()
-                });
-                
-            } else if (path.startsWith('/api/prices/') && method === 'GET') {
-                // Get specific metal price
-                const metalName = path.split('/')[3];
-                const price = this.tracker.getMetalPrice(metalName);
-                
-                if (price) {
-                    this.sendJSON(res, {
-                        success: true,
-                        data: price,
-                        timestamp: new Date().toISOString()
-                    });
-                } else {
-                    this.sendJSON(res, {
-                        success: false,
-                        error: `Metal '${metalName}' not found`,
-                        availableMetals: ['gold', 'silver', 'platinum', 'palladium']
-                    }, 404);
-                }
-                
-            } else if (path === '/api/refresh' && method === 'POST') {
-                // Force refresh prices
-                const updates = await this.tracker.forceRefresh();
-                this.sendJSON(res, {
-                    success: true,
-                    message: 'Prices refreshed',
-                    updates: updates,
-                    timestamp: new Date().toISOString()
-                });
-                
-            } else if (path === '/api/status' && method === 'GET') {
-                // Get API status
-                this.sendJSON(res, {
-                    success: true,
-                    status: this.tracker.getAPIStatus(),
-                    timestamp: new Date().toISOString()
-                });
-                
-            } else if (path === '/api/health' && method === 'GET') {
-                // Health check
-                this.sendJSON(res, {
-                    success: true,
-                    status: 'healthy',
-                    uptime: process.uptime(),
-                    timestamp: new Date().toISOString()
-                });
-                
-            } else {
-                // 404 Not Found
-                this.sendJSON(res, {
-                    success: false,
-                    error: 'Endpoint not found',
-                    availableEndpoints: [
-                        'GET /api/prices',
-                        'GET /api/prices/{metal}',
-                        'POST /api/refresh',
-                        'GET /api/status',
-                        'GET /api/health'
-                    ]
-                }, 404);
+        const notificationPayload = {
+            title: `New ${signal.symbol} Signal`,
+            body: `${signal.trade_type} signal at $${signal.entry_price}`,
+            data: {
+                signal_id: signal.id,
+                symbol: signal.symbol,
+                trade_type: signal.trade_type,
+                entry_price: signal.entry_price
             }
-            
-        } catch (error) {
-            console.error('❌ API Error:', error.message);
-            this.sendJSON(res, {
-                success: false,
-                error: 'Internal server error',
-                message: error.message
-            }, 500);
-        }
-    }
-    
-    // Start the API server
-    start() {
-        this.server = http.createServer((req, res) => {
-            this.handleRequest(req, res);
-        });
-  this.server.listen(this.port, '0.0.0.0', () => {
-  console.log(`🌐 REST API Server running on http://0.0.0.0:${this.port}`);
-            console.log(`📡 Available endpoints:`);
-            console.log(`   GET  /api/prices - Get all metal prices`);
-            console.log(`   GET  /api/prices/{metal} - Get specific metal price`);
-            console.log(`   POST /api/refresh - Force refresh prices`);
-            console.log(`   GET  /api/status - Get API status`);
-            console.log(`   GET  /api/health - Health check`);
-        });
-    }
-    
-    // Stop the API server
-    stop() {
-        if (this.server) {
-            this.server.close(() => {
-                console.log('🌐 REST API Server stopped');
-            });
-        }
-    }
+        };
+        
+        // Here you would integrate with your notification service (FCM, etc.)
+        console.log(`📱 Would send notification to ${users.length} users:`, notificationPayload);
+        
+        // Example FCM integration (you'll need to implement this):
+        // sendFCMNotification(users.map(u => u.device_token), notificationPayload);
+    });
 }
 
-// Main execution
-const API_KEY = 'i4wKSoyGcr94hGIydnBO3SjpOO1YKD1O';
+// Existing price endpoints (keeping your original functionality)
+app.get('/api/prices', (req, res) => {
+    db.all('SELECT * FROM prices ORDER BY last_updated DESC', [], (err, rows) => {
+        if (err) {
+            console.error('❌ Database error:', err);
+            return res.status(500).json({ error: 'Database error' });
+        }
+        
+        const prices = rows.reduce((acc, row) => {
+            acc[row.metal] = {
+                price: row.price,
+                change_24h: row.change_24h,
+                change_percent: row.change_percent,
+                last_updated: row.last_updated
+            };
+            return acc;
+        }, {});
+        
+        res.json({
+            success: true,
+            timestamp: new Date().toISOString(),
+            prices
+        });
+    });
+});
 
-if (!API_KEY || API_KEY === 'your_actual_api_key_here') {
-    console.error('❌ Please set your Polygon.io API key in the API_KEY variable');
-    console.error('💡 Get your API key from: https://polygon.io/dashboard');
-    process.exit(1);
-}
+// Health check
+app.get('/api/health', (req, res) => {
+    res.json({
+        status: 'healthy',
+        timestamp: new Date().toISOString(),
+        database: 'connected'
+    });
+});
 
-// Create tracker and API server
-const tracker = new DatabasePreciousMetalsTracker(API_KEY);
-const api = new PreciousMetalsAPI(tracker, 3000);
-
-// Start API server after a short delay to ensure tracker is initialized
-setTimeout(() => {
-    api.start();
-}, 3000);
+// Start server
+app.listen(PORT, '0.0.0.0', () => {
+    console.log('🚀 Enhanced Gold Tracker API Server Started');
+    console.log(`🌐 Server running on http://0.0.0.0:${PORT}`);
+    console.log('📡 Available endpoints:');
+    console.log('   📊 Prices:');
+    console.log('      GET  /api/prices - Get all metal prices');
+    console.log('      GET  /api/metals/{symbol}/price - Get specific metal price');
+    console.log('   📈 Signals:');
+    console.log('      GET  /api/signals - Get all signals');
+    console.log('      GET  /api/signals/{id} - Get specific signal');
+    console.log('      POST /api/signals - Create new signal');
+    console.log('      PUT  /api/signals/{id} - Update signal');
+    console.log('      DELETE /api/signals/{id} - Delete signal');
+    console.log('   👥 Users:');
+    console.log('      POST /api/users/register - Register device for notifications');
+    console.log('   🔧 System:');
+    console.log('      GET  /api/health - Health check');
+    console.log('💾 Database: SQLite with signals table initialized');
+});
 
 // Graceful shutdown
 process.on('SIGINT', () => {
-    console.log('\n👋 Shutting down gracefully...');
-    api.stop();
-    tracker.stop();
-    setTimeout(() => {
-        console.log('✅ Shutdown complete');
+    console.log('\n🛑 Shutting down gracefully...');
+    db.close((err) => {
+        if (err) {
+            console.error('❌ Error closing database:', err);
+        } else {
+            console.log('💾 Database connection closed');
+        }
         process.exit(0);
-    }, 2000);
+    });
 });
-
-process.on('SIGTERM', () => {
-    console.log('\n👋 Shutting down gracefully...');
-    api.stop();
-    tracker.stop();
-    setTimeout(() => {
-        console.log('✅ Shutdown complete');
-        process.exit(0);
-    }, 2000);
-});
-
-// Export for use in other modules
-module.exports = { DatabasePreciousMetalsTracker, PreciousMetalsAPI };
