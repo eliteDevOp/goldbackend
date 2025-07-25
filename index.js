@@ -110,6 +110,42 @@ db.serialize(() => {
         subscribed BOOLEAN DEFAULT 1,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
+
+    // New statistics table
+    db.run(`CREATE TABLE IF NOT EXISTS trade_statistics (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        total_trades INTEGER DEFAULT 0,
+        win_trades INTEGER DEFAULT 0,
+        lose_trades INTEGER DEFAULT 0,
+        total_profit REAL DEFAULT 0.0,
+        win_rate REAL DEFAULT 0.0,
+        last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+
+    // New trade history table
+    db.run(`CREATE TABLE IF NOT EXISTS trade_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        signal_id INTEGER,
+        symbol TEXT NOT NULL,
+        trade_type TEXT NOT NULL,
+        entry_price REAL NOT NULL,
+        exit_price REAL NOT NULL,
+        price_change REAL NOT NULL,
+        percentage_change REAL NOT NULL,
+        result TEXT NOT NULL, -- 'profit' or 'loss'
+        pips REAL NOT NULL,
+        closed_by TEXT DEFAULT 'admin',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+
+    // Initialize statistics if not exists
+    db.get('SELECT COUNT(*) as count FROM trade_statistics', [], (err, row) => {
+        if (!err && row.count === 0) {
+            db.run(`INSERT INTO trade_statistics (total_trades, win_trades, lose_trades, total_profit, win_rate) 
+                    VALUES (0, 0, 0, 0.0, 0.0)`);
+            logWithTimestamp('✅ Initialized trade statistics');
+        }
+    });
 });
 
 // Call once on startup and every 5 minutes
@@ -348,6 +384,204 @@ app.get('/api/signals/:id', (req, res) => {
     });
 });
 
+// ========== STATISTICS ROUTES ==========
+
+// Get trade statistics
+app.get('/api/statistics', (req, res) => {
+    db.get('SELECT * FROM trade_statistics ORDER BY last_updated DESC LIMIT 1', [], (err, row) => {
+        if (err) {
+            console.error('❌ Database error:', err);
+            return res.status(500).json({ error: 'Database error' });
+        }
+
+        if (!row) {
+            // Return default statistics if none exist
+            const defaultStats = {
+                total_trades: 0,
+                win_trades: 0,
+                lose_trades: 0,
+                total_profit: 0.0,
+                win_rate: 0.0,
+                last_updated: new Date().toISOString()
+            };
+            return res.json({
+                success: true,
+                statistics: defaultStats,
+                timestamp: new Date().toISOString()
+            });
+        }
+
+        logWithTimestamp(`📊 Retrieved trade statistics`);
+        res.json({
+            success: true,
+            statistics: row,
+            timestamp: new Date().toISOString()
+        });
+    });
+});
+
+// Add trade result and update statistics
+app.post('/api/statistics/trade', (req, res) => {
+    const {
+        signal_id,
+        symbol,
+        trade_type,
+        entry_price,
+        exit_price,
+        price_change,
+        percentage_change,
+        result, // 'profit' or 'loss'
+        pips,
+        closed_by = 'admin'
+    } = req.body;
+
+    // Validation
+    if (!symbol || !trade_type || !entry_price || !exit_price || !result || pips === undefined) {
+        return res.status(400).json({
+            error: 'Missing required fields: symbol, trade_type, entry_price, exit_price, result, pips'
+        });
+    }
+
+    if (!['profit', 'loss'].includes(result)) {
+        return res.status(400).json({ error: 'Result must be either "profit" or "loss"' });
+    }
+
+    logWithTimestamp(`📈 Adding trade result: ${symbol} ${result} ${pips} pips`);
+
+    // Start transaction
+    db.serialize(() => {
+        db.run('BEGIN TRANSACTION');
+
+        // Insert trade history record
+        db.run(`
+            INSERT INTO trade_history (
+                signal_id, symbol, trade_type, entry_price, exit_price, 
+                price_change, percentage_change, result, pips, closed_by
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `, [
+            signal_id,
+            symbol,
+            trade_type,
+            entry_price,
+            exit_price,
+            price_change,
+            percentage_change,
+            result,
+            pips,
+            closed_by
+        ], function(err) {
+            if (err) {
+                console.error('❌ Error adding trade history:', err);
+                db.run('ROLLBACK');
+                return res.status(500).json({ error: 'Failed to add trade history' });
+            }
+
+            const tradeHistoryId = this.lastID;
+
+            // Get current statistics
+            db.get('SELECT * FROM trade_statistics ORDER BY last_updated DESC LIMIT 1', [], (err, stats) => {
+                if (err) {
+                    console.error('❌ Error getting statistics:', err);
+                    db.run('ROLLBACK');
+                    return res.status(500).json({ error: 'Failed to get current statistics' });
+                }
+
+                // Calculate new statistics
+                const currentStats = stats || {
+                    total_trades: 0,
+                    win_trades: 0,
+                    lose_trades: 0,
+                    total_profit: 0.0
+                };
+
+                const newTotalTrades = currentStats.total_trades + 1;
+                const newWinTrades = currentStats.win_trades + (result === 'profit' ? 1 : 0);
+                const newLoseTrades = currentStats.lose_trades + (result === 'loss' ? 1 : 0);
+                const newTotalProfit = currentStats.total_profit + (result === 'profit' ? pips : -pips);
+                const newWinRate = newTotalTrades > 0 ? (newWinTrades / newTotalTrades) * 100 : 0;
+
+                // Update statistics
+                db.run(`
+                    INSERT OR REPLACE INTO trade_statistics (
+                        id, total_trades, win_trades, lose_trades, total_profit, win_rate, last_updated
+                    ) VALUES (
+                        COALESCE((SELECT id FROM trade_statistics ORDER BY last_updated DESC LIMIT 1), 1),
+                        ?, ?, ?, ?, ?, CURRENT_TIMESTAMP
+                    )
+                `, [
+                    newTotalTrades,
+                    newWinTrades,
+                    newLoseTrades,
+                    newTotalProfit,
+                    newWinRate
+                ], function(err) {
+                    if (err) {
+                        console.error('❌ Error updating statistics:', err);
+                        db.run('ROLLBACK');
+                        return res.status(500).json({ error: 'Failed to update statistics' });
+                    }
+
+                    // Commit transaction
+                    db.run('COMMIT', (err) => {
+                        if (err) {
+                            console.error('❌ Error committing transaction:', err);
+                            return res.status(500).json({ error: 'Failed to commit changes' });
+                        }
+
+                        logWithTimestamp(`✅ Trade result added and statistics updated`);
+                        res.json({
+                            success: true,
+                            message: 'Trade result added and statistics updated successfully',
+                            trade_history_id: tradeHistoryId,
+                            statistics: {
+                                total_trades: newTotalTrades,
+                                win_trades: newWinTrades,
+                                lose_trades: newLoseTrades,
+                                total_profit: newTotalProfit,
+                                win_rate: newWinRate
+                            },
+                            timestamp: new Date().toISOString()
+                        });
+                    });
+                });
+            });
+        });
+    });
+});
+
+// Get trade history
+app.get('/api/statistics/history', (req, res) => {
+    const { limit = 50, offset = 0 } = req.query;
+
+    db.all(`
+        SELECT * FROM trade_history 
+        ORDER BY created_at DESC 
+        LIMIT ? OFFSET ?
+    `, [parseInt(limit), parseInt(offset)], (err, rows) => {
+        if (err) {
+            console.error('❌ Database error:', err);
+            return res.status(500).json({ error: 'Database error' });
+        }
+
+        // Get total count
+        db.get('SELECT COUNT(*) as total FROM trade_history', [], (err, countRow) => {
+            if (err) {
+                console.error('❌ Database error:', err);
+                return res.status(500).json({ error: 'Database error' });
+            }
+
+            logWithTimestamp(`📋 Retrieved ${rows.length} trade history records`);
+            res.json({
+                success: true,
+                history: rows,
+                count: rows.length,
+                total: countRow.total,
+                timestamp: new Date().toISOString()
+            });
+        });
+    });
+});
+
 // ========== START SERVER ==========
 app.listen(PORT, '0.0.0.0', () => {
     console.log('🚀 Enhanced Gold Tracker API Server Started');
@@ -362,6 +596,10 @@ app.listen(PORT, '0.0.0.0', () => {
     console.log('      PUT  /api/signals/{id} - Update signal');
     console.log('      DELETE /api/signals/{id} - Delete signal');
     console.log('      GET  /api/signals/{id} - Get specific signal');
+    console.log('   📊 Statistics:');
+    console.log('      GET  /api/statistics - Get trade statistics');
+    console.log('      POST /api/statistics/trade - Add trade result');
+    console.log('      GET  /api/statistics/history - Get trade history');
     console.log('   🔧 System:');
     console.log('      GET  /api/health - Health check');
 });
