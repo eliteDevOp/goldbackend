@@ -15,13 +15,14 @@ app.use(express.json());
 const dbPath = path.join(__dirname, 'gold_tracker.db');
 const db = new sqlite3.Database(dbPath);
 
-// API Configuration
-const POLYGON_API_KEY = 'i4wKSoyGcr94hGIydnBO3SjpOO1YKD1O'; // Replace with your actual key
+// GoldAPI Configuration
+const GOLDAPI_KEY = 'goldapi-75sa519mditl5es-io';
+const GOLDAPI_BASE_URL = 'https://www.goldapi.io/api';
 const metals = {
-    'XAU': 'C:XAUUSD',
-    'XAG': 'C:XAGUSD',
-    'XPT': 'C:XPTUSD',
-    'XPD': 'C:XPDUSD'
+    'XAU': 'XAU/USD', // Gold
+    'XAG': 'XAG/USD', // Silver
+    'XPT': 'XPT/USD', // Platinum
+    'XPD': 'XPD/USD'  // Palladium
 };
 
 // Helper functions
@@ -32,56 +33,169 @@ function logWithTimestamp(message) {
 }
 
 async function fetchMetalPrice(metalSymbol) {
-    const ticker = metals[metalSymbol];
-    if (!ticker) throw new Error(`Unsupported metal symbol: ${metalSymbol}`);
+    const endpoint = metals[metalSymbol];
+    if (!endpoint) throw new Error(`Unsupported metal symbol: ${metalSymbol}`);
 
-    logWithTimestamp(`📡 Fetching price for ${metalSymbol}`);
-    const response = await axios.get(`https://api.polygon.io/v2/aggs/ticker/${ticker}/prev`, {
-        params: { adjusted: 'true', apikey: POLYGON_API_KEY }
-    });
+    logWithTimestamp(`📡 Fetching price for ${metalSymbol} from GoldAPI`);
+    
+    try {
+        const response = await axios.get(`${GOLDAPI_BASE_URL}/${endpoint}`, {
+            headers: {
+                'x-access-token': GOLDAPI_KEY,
+                'Content-Type': 'application/json'
+            }
+        });
 
-    const result = response.data?.results?.[0];
-    if (!result) throw new Error('No price data available');
+        const data = response.data;
+        
+        if (data.error) {
+            throw new Error(`GoldAPI Error: ${data.error}`);
+        }
 
-    return {
-        price: result.c,
-        change: result.c - result.o,
-        changePercent: ((result.c - result.o) / result.o) * 100
-    };
-}
+        // Calculate estimated current price using ask and bid
+        const askPrice = data.ask || data.price;
+        const bidPrice = data.bid || data.price;
+        const estimatedPrice = (askPrice + bidPrice) / 2;
+        
+        // Calculate change from previous close (if available)
+        const previousClose = data.prev_close_price || estimatedPrice;
+        const change = estimatedPrice - previousClose;
+        const changePercent = ((change / previousClose) * 100);
 
-async function updateAllMetalPrices() {
-    for (const symbol in metals) {
-        try {
-            const { price, change, changePercent } = await fetchMetalPrice(symbol);
-            db.run(`
-                INSERT INTO prices (metal, price, change_24h, change_percent, last_updated)
-                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(metal) DO UPDATE SET 
-                    price = excluded.price,
-                    change_24h = excluded.change_24h,
-                    change_percent = excluded.change_percent,
-                    last_updated = CURRENT_TIMESTAMP
-            `, [symbol, price, change, changePercent], (err) => {
-                if (err) console.error(`❌ Failed to update ${symbol}:`, err.message);
-                else logWithTimestamp(`✅ Updated ${symbol} price: $${price.toFixed(2)}`);
-            });
-        } catch (err) {
-            console.error(`❌ Error updating ${symbol}:`, err.message);
+        logWithTimestamp(`✅ ${metalSymbol} - Ask: $${askPrice}, Bid: $${bidPrice}, Estimated: $${estimatedPrice.toFixed(2)}`);
+
+        return {
+            price: estimatedPrice,
+            ask: askPrice,
+            bid: bidPrice,
+            change: change,
+            changePercent: changePercent,
+            timestamp: data.timestamp || new Date().getTime(),
+            high_24h: data.high_24h,
+            low_24h: data.low_24h,
+            open_price: data.open_price,
+            prev_close_price: data.prev_close_price
+        };
+    } catch (error) {
+        if (error.response) {
+            logWithTimestamp(`❌ GoldAPI HTTP Error ${error.response.status}: ${error.response.data?.error || error.message}`);
+            throw new Error(`GoldAPI Error: ${error.response.data?.error || error.message}`);
+        } else if (error.request) {
+            logWithTimestamp(`❌ Network Error: ${error.message}`);
+            throw new Error(`Network Error: Unable to reach GoldAPI`);
+        } else {
+            logWithTimestamp(`❌ Error: ${error.message}`);
+            throw error;
         }
     }
 }
 
+async function updateAllMetalPrices() {
+    logWithTimestamp('🔄 Starting price update cycle...');
+    
+    for (const symbol in metals) {
+        try {
+            const priceData = await fetchMetalPrice(symbol);
+            
+            // Check if price has changed before updating
+            db.get('SELECT price FROM prices WHERE metal = ?', [symbol], (err, row) => {
+                if (err) {
+                    console.error(`❌ Error checking existing price for ${symbol}:`, err.message);
+                    return;
+                }
+
+                const hasChanged = !row || Math.abs(row.price - priceData.price) > 0.01; // Only update if price changed by more than $0.01
+                
+                if (hasChanged) {
+                    db.run(`
+                        INSERT INTO prices (
+                            metal, price, ask_price, bid_price, change_24h, change_percent, 
+                            high_24h, low_24h, open_price, prev_close_price, last_updated
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        ON CONFLICT(metal) DO UPDATE SET 
+                            price = excluded.price,
+                            ask_price = excluded.ask_price,
+                            bid_price = excluded.bid_price,
+                            change_24h = excluded.change_24h,
+                            change_percent = excluded.change_percent,
+                            high_24h = excluded.high_24h,
+                            low_24h = excluded.low_24h,
+                            open_price = excluded.open_price,
+                            prev_close_price = excluded.prev_close_price,
+                            last_updated = CURRENT_TIMESTAMP
+                    `, [
+                        symbol, 
+                        priceData.price, 
+                        priceData.ask, 
+                        priceData.bid, 
+                        priceData.change, 
+                        priceData.changePercent,
+                        priceData.high_24h,
+                        priceData.low_24h,
+                        priceData.open_price,
+                        priceData.prev_close_price
+                    ], (err) => {
+                        if (err) {
+                            console.error(`❌ Failed to update ${symbol}:`, err.message);
+                        } else {
+                            logWithTimestamp(`✅ Updated ${symbol} price: $${priceData.price.toFixed(2)} (Ask: $${priceData.ask}, Bid: $${priceData.bid})`);
+                        }
+                    });
+                } else {
+                    logWithTimestamp(`📊 ${symbol} price unchanged: $${priceData.price.toFixed(2)}`);
+                }
+            });
+
+            // Add small delay between API calls to avoid rate limiting
+            await new Promise(resolve => setTimeout(resolve, 500));
+            
+        } catch (err) {
+            console.error(`❌ Error updating ${symbol}:`, err.message);
+        }
+    }
+    
+    logWithTimestamp('✅ Price update cycle completed');
+}
+
 // Initialize database tables
 db.serialize(() => {
+    // Create or update prices table to include GoldAPI fields
     db.run(`CREATE TABLE IF NOT EXISTS prices (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         metal TEXT UNIQUE NOT NULL,
         price REAL NOT NULL,
+        ask_price REAL,
+        bid_price REAL,
         change_24h REAL,
         change_percent REAL,
+        high_24h REAL,
+        low_24h REAL,
+        open_price REAL,
+        prev_close_price REAL,
         last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
+
+    // Add missing columns to existing prices table (for database migration)
+    const columnsToAdd = [
+        'ask_price REAL',
+        'bid_price REAL', 
+        'high_24h REAL',
+        'low_24h REAL',
+        'open_price REAL',
+        'prev_close_price REAL'
+    ];
+
+    columnsToAdd.forEach(column => {
+        const columnName = column.split(' ')[0];
+        db.run(`ALTER TABLE prices ADD COLUMN ${column}`, (err) => {
+            if (err && !err.message.includes('duplicate column name')) {
+                console.error(`❌ Error adding column ${columnName}:`, err.message);
+            } else if (!err) {
+                logWithTimestamp(`✅ Added column ${columnName} to prices table`);
+            }
+        });
+    });
 
     db.run(`CREATE TABLE IF NOT EXISTS signals (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -111,7 +225,6 @@ db.serialize(() => {
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
 
-    // New statistics table
     db.run(`CREATE TABLE IF NOT EXISTS trade_statistics (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         total_trades INTEGER DEFAULT 0,
@@ -122,7 +235,6 @@ db.serialize(() => {
         last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
 
-    // New trade history table
     db.run(`CREATE TABLE IF NOT EXISTS trade_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         signal_id INTEGER,
@@ -132,7 +244,7 @@ db.serialize(() => {
         exit_price REAL NOT NULL,
         price_change REAL NOT NULL,
         percentage_change REAL NOT NULL,
-        result TEXT NOT NULL, -- 'profit' or 'loss'
+        result TEXT NOT NULL,
         pips REAL NOT NULL,
         closed_by TEXT DEFAULT 'admin',
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -148,9 +260,10 @@ db.serialize(() => {
     });
 });
 
-// Call once on startup and every 5 minutes
+// Start price updates - Initial call and then every 15 seconds
+logWithTimestamp('🚀 Starting GoldAPI price monitoring...');
 updateAllMetalPrices();
-setInterval(updateAllMetalPrices, 1 * 60 * 1000);
+setInterval(updateAllMetalPrices, 15 * 1000); // 15 seconds interval
 
 // ========== ROUTES ==========
 
@@ -165,45 +278,81 @@ app.get('/api/prices', (req, res) => {
         const prices = rows.reduce((acc, row) => {
             acc[row.metal] = {
                 price: row.price,
+                ask_price: row.ask_price,
+                bid_price: row.bid_price,
                 change_24h: row.change_24h,
                 change_percent: row.change_percent,
+                high_24h: row.high_24h,
+                low_24h: row.low_24h,
+                open_price: row.open_price,
+                prev_close_price: row.prev_close_price,
                 last_updated: row.last_updated
             };
             return acc;
         }, {});
 
+        logWithTimestamp(`📊 Served price data for ${rows.length} metals`);
         res.json({
             success: true,
             timestamp: new Date().toISOString(),
-            prices
+            prices,
+            source: 'GoldAPI.io'
         });
     });
 });
 
-// Get live metal price from API
+// Get live metal price from GoldAPI
 app.get('/api/metals/:symbol/price', async (req, res) => {
     try {
         const { symbol } = req.params;
-        if (!metals[symbol]) return res.status(400).json({ error: 'Invalid symbol' });
+        if (!metals[symbol]) {
+            return res.status(400).json({ 
+                error: 'Invalid symbol', 
+                supported_symbols: Object.keys(metals) 
+            });
+        }
 
         const data = await fetchMetalPrice(symbol);
         res.json({
             success: true,
             symbol,
             ...data,
-            timestamp: new Date().toISOString()
+            timestamp: new Date().toISOString(),
+            source: 'GoldAPI.io'
         });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        res.status(500).json({ 
+            error: err.message,
+            timestamp: new Date().toISOString()
+        });
     }
 });
 
-// Health check
-app.get('/api/health', (req, res) => {
+// Health check with GoldAPI status
+app.get('/api/health', async (req, res) => {
+    let goldApiStatus = 'unknown';
+    
+    try {
+        // Test GoldAPI connectivity
+        await axios.get(`${GOLDAPI_BASE_URL}/XAU/USD`, {
+            headers: {
+                'x-access-token': GOLDAPI_KEY,
+                'Content-Type': 'application/json'
+            },
+            timeout: 5000
+        });
+        goldApiStatus = 'connected';
+    } catch (error) {
+        goldApiStatus = 'error';
+    }
+
     res.json({
         status: 'healthy',
         timestamp: new Date().toISOString(),
-        database: 'connected'
+        database: 'connected',
+        goldapi: goldApiStatus,
+        update_interval: '15 seconds',
+        supported_metals: Object.keys(metals)
     });
 });
 
@@ -266,8 +415,8 @@ app.post('/api/signals', (req, res) => {
         target3 || null,
         stoploss,
         send_notifications !== false,
-        entry_price, // Initialize current_price with entry_price
-        0.0 // Initialize percentage_change
+        entry_price,
+        0.0
     ], function(err) {
         if (err) {
             console.error('❌ Error adding signal:', err);
@@ -395,7 +544,6 @@ app.get('/api/statistics', (req, res) => {
         }
 
         if (!row) {
-            // Return default statistics if none exist
             const defaultStats = {
                 total_trades: 0,
                 win_trades: 0,
@@ -430,7 +578,7 @@ app.post('/api/statistics/trade', (req, res) => {
         exit_price,
         price_change,
         percentage_change,
-        result, // 'profit' or 'loss'
+        result,
         pips,
         closed_by = 'admin'
     } = req.body;
@@ -584,8 +732,10 @@ app.get('/api/statistics/history', (req, res) => {
 
 // ========== START SERVER ==========
 app.listen(PORT, '0.0.0.0', () => {
-    console.log('🚀 Enhanced Gold Tracker API Server Started');
+    console.log('🚀 Enhanced Gold Tracker API Server with GoldAPI.io Started');
     console.log(`🌐 Server running on http://0.0.0.0:${PORT}`);
+    console.log('🔑 Using GoldAPI.io for real-time precious metals prices');
+    console.log('⏰ Price updates every 15 seconds');
     console.log('📡 Available endpoints:');
     console.log('   📊 Prices:');
     console.log('      GET  /api/prices - Get all metal prices');
@@ -602,6 +752,7 @@ app.listen(PORT, '0.0.0.0', () => {
     console.log('      GET  /api/statistics/history - Get trade history');
     console.log('   🔧 System:');
     console.log('      GET  /api/health - Health check');
+    console.log(`📋 Supported metals: ${Object.keys(metals).join(', ')}`);
 });
 
 // ========== SHUTDOWN ==========
