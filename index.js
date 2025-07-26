@@ -2,69 +2,228 @@ const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
 const axios = require('axios');
 const cors = require('cors');
+const compression = require('compression');
+const helmet = require('helmet');
 const path = require('path');
+const http = require('http');
+const https = require('https');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
-app.use(cors());
-app.use(express.json());
+// ========== MIDDLEWARE OPTIMIZATIONS ==========
 
-// Database setup
+// Compression middleware
+app.use(compression({
+    level: 6,
+    threshold: 1024,
+    filter: (req, res) => {
+        if (req.headers['x-no-compression']) return false;
+        return compression.filter(req, res);
+    }
+}));
+
+// Security middleware
+app.use(helmet({
+    crossOriginResourcePolicy: { policy: "cross-origin" }
+}));
+
+// Optimized CORS
+app.use(cors({
+    origin: process.env.NODE_ENV === 'production' 
+        ? process.env.ALLOWED_ORIGINS?.split(',') || true
+        : true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    maxAge: 86400
+}));
+
+// JSON parsing with limits
+app.use(express.json({ 
+    limit: '10mb',
+    strict: true
+}));
+
+// Request timeout middleware
+app.use((req, res, next) => {
+    const timeout = setTimeout(() => {
+        if (!res.headersSent) {
+            res.status(408).json({ 
+                error: 'Request timeout',
+                message: 'The request took too long to process'
+            });
+        }
+    }, 30000);
+
+    res.on('finish', () => clearTimeout(timeout));
+    next();
+});
+
+// Response time tracking
+app.use((req, res, next) => {
+    const start = Date.now();
+    res.on('finish', () => {
+        const duration = Date.now() - start;
+        if (duration > 5000) {
+            console.log(`🐌 Slow request: ${req.method} ${req.path} took ${duration}ms`);
+        }
+    });
+    next();
+});
+
+// ========== DATABASE OPTIMIZATIONS ==========
+
 const dbPath = path.join(__dirname, 'gold_tracker.db');
-const db = new sqlite3.Database(dbPath);
+const db = new sqlite3.Database(dbPath, sqlite3.OPEN_READWRITE | sqlite3.OPEN_CREATE, (err) => {
+    if (err) {
+        console.error('❌ Error opening database:', err.message);
+    } else {
+        console.log('✅ Connected to SQLite database');
+        
+        // Optimize SQLite settings
+        db.run('PRAGMA journal_mode = WAL;');
+        db.run('PRAGMA synchronous = NORMAL;');
+        db.run('PRAGMA cache_size = 10000;');
+        db.run('PRAGMA temp_store = MEMORY;');
+        db.run('PRAGMA mmap_size = 268435456;');
+    }
+});
 
-// GoldAPI Configuration
+db.configure('busyTimeout', 30000);
+
+// Promisified database functions
+function dbGet(query, params = []) {
+    return new Promise((resolve, reject) => {
+        db.get(query, params, (err, row) => {
+            if (err) reject(err);
+            else resolve(row);
+        });
+    });
+}
+
+function dbAll(query, params = []) {
+    return new Promise((resolve, reject) => {
+        db.all(query, params, (err, rows) => {
+            if (err) reject(err);
+            else resolve(rows);
+        });
+    });
+}
+
+function dbRun(query, params = []) {
+    return new Promise((resolve, reject) => {
+        db.run(query, params, function(err) {
+            if (err) reject(err);
+            else resolve({ lastID: this.lastID, changes: this.changes });
+        });
+    });
+}
+
+// ========== API CLIENT OPTIMIZATIONS ==========
+
 const GOLDAPI_KEY = 'goldapi-75sa519mditl5es-io';
 const GOLDAPI_BASE_URL = 'https://www.goldapi.io/api';
 const metals = {
-    'XAU': 'XAU/USD', // Gold
-    'XAG': 'XAG/USD', // Silver
-    'XPT': 'XPT/USD', // Platinum
-    'XPD': 'XPD/USD'  // Palladium
+    'XAU': 'XAU/USD',
+    'XAG': 'XAG/USD',
+    'XPT': 'XPT/USD',
+    'XPD': 'XPD/USD'
 };
 
-// Helper functions
+// Optimized axios client with connection pooling
+const goldApiClient = axios.create({
+    baseURL: GOLDAPI_BASE_URL,
+    timeout: 10000,
+    headers: {
+        'x-access-token': GOLDAPI_KEY,
+        'Content-Type': 'application/json',
+        'Connection': 'keep-alive'
+    },
+    httpAgent: new http.Agent({
+        keepAlive: true,
+        maxSockets: 10,
+        maxFreeSockets: 2,
+        timeout: 60000,
+        freeSocketTimeout: 30000
+    }),
+    httpsAgent: new https.Agent({
+        keepAlive: true,
+        maxSockets: 10,
+        maxFreeSockets: 2,
+        timeout: 60000,
+        freeSocketTimeout: 30000
+    })
+});
+
+// Price caching
+const priceCache = new Map();
+const CACHE_DURATION = 10000; // 10 seconds
+
+// Response caching middleware
+const responseCache = new Map();
+function cacheMiddleware(duration = 30000) {
+    return (req, res, next) => {
+        if (req.method !== 'GET') return next();
+        
+        const key = `${req.originalUrl}`;
+        const cached = responseCache.get(key);
+        
+        if (cached && Date.now() - cached.timestamp < duration) {
+            return res.json(cached.data);
+        }
+        
+        const originalJson = res.json;
+        res.json = function(data) {
+            responseCache.set(key, {
+                data: data,
+                timestamp: Date.now()
+            });
+            return originalJson.call(this, data);
+        };
+        
+        next();
+    };
+}
+
+// ========== HELPER FUNCTIONS ==========
+
 function logWithTimestamp(message) {
     const now = new Date();
     const timestamp = now.toLocaleTimeString();
     console.log(`${message} (${timestamp})`);
 }
 
-async function fetchMetalPrice(metalSymbol) {
+async function fetchMetalPrice(metalSymbol, useCache = true) {
     const endpoint = metals[metalSymbol];
     if (!endpoint) throw new Error(`Unsupported metal symbol: ${metalSymbol}`);
+
+    // Check cache first
+    if (useCache) {
+        const cached = priceCache.get(metalSymbol);
+        if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
+            logWithTimestamp(`📦 Using cached price for ${metalSymbol}`);
+            return cached.data;
+        }
+    }
 
     logWithTimestamp(`📡 Fetching price for ${metalSymbol} from GoldAPI`);
     
     try {
-        const response = await axios.get(`${GOLDAPI_BASE_URL}/${endpoint}`, {
-            headers: {
-                'x-access-token': GOLDAPI_KEY,
-                'Content-Type': 'application/json'
-            }
-        });
-
+        const response = await goldApiClient.get(`/${endpoint}`);
         const data = response.data;
         
         if (data.error) {
             throw new Error(`GoldAPI Error: ${data.error}`);
         }
 
-        // Calculate estimated current price using ask and bid
         const askPrice = data.ask || data.price;
         const bidPrice = data.bid || data.price;
         const estimatedPrice = (askPrice + bidPrice) / 2;
-        
-        // Calculate change from previous close (if available)
         const previousClose = data.prev_close_price || estimatedPrice;
         const change = estimatedPrice - previousClose;
         const changePercent = ((change / previousClose) * 100);
 
-        logWithTimestamp(`✅ ${metalSymbol} - Ask: $${askPrice}, Bid: $${bidPrice}, Estimated: $${estimatedPrice.toFixed(2)}`);
-
-        return {
+        const priceData = {
             price: estimatedPrice,
             ask: askPrice,
             bid: bidPrice,
@@ -76,9 +235,26 @@ async function fetchMetalPrice(metalSymbol) {
             open_price: data.open_price,
             prev_close_price: data.prev_close_price
         };
+
+        // Cache the result
+        if (useCache) {
+            priceCache.set(metalSymbol, {
+                data: priceData,
+                timestamp: Date.now()
+            });
+        }
+
+        logWithTimestamp(`✅ ${metalSymbol} - Price: $${estimatedPrice.toFixed(2)}`);
+        return priceData;
+
     } catch (error) {
+        if (error.code === 'ECONNABORTED') {
+            logWithTimestamp(`⏰ Timeout fetching ${metalSymbol} price`);
+            throw new Error(`Timeout: Unable to fetch ${metalSymbol} price`);
+        }
+        
         if (error.response) {
-            logWithTimestamp(`❌ GoldAPI HTTP Error ${error.response.status}: ${error.response.data?.error || error.message}`);
+            logWithTimestamp(`❌ GoldAPI HTTP Error ${error.response.status}`);
             throw new Error(`GoldAPI Error: ${error.response.data?.error || error.message}`);
         } else if (error.request) {
             logWithTimestamp(`❌ Network Error: ${error.message}`);
@@ -90,77 +266,67 @@ async function fetchMetalPrice(metalSymbol) {
     }
 }
 
+// Optimized batch price update with parallel processing
 async function updateAllMetalPrices() {
     logWithTimestamp('🔄 Starting price update cycle...');
     
-    for (const symbol in metals) {
+    const updatePromises = Object.keys(metals).map(async (symbol) => {
         try {
             const priceData = await fetchMetalPrice(symbol);
             
-            // Check if price has changed before updating
-            db.get('SELECT price FROM prices WHERE metal = ?', [symbol], (err, row) => {
-                if (err) {
-                    console.error(`❌ Error checking existing price for ${symbol}:`, err.message);
-                    return;
-                }
-
-                const hasChanged = !row || Math.abs(row.price - priceData.price) > 0.01; // Only update if price changed by more than $0.01
-                
-                if (hasChanged) {
-                    db.run(`
-                        INSERT INTO prices (
-                            metal, price, ask_price, bid_price, change_24h, change_percent, 
-                            high_24h, low_24h, open_price, prev_close_price, last_updated
-                        )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                        ON CONFLICT(metal) DO UPDATE SET 
-                            price = excluded.price,
-                            ask_price = excluded.ask_price,
-                            bid_price = excluded.bid_price,
-                            change_24h = excluded.change_24h,
-                            change_percent = excluded.change_percent,
-                            high_24h = excluded.high_24h,
-                            low_24h = excluded.low_24h,
-                            open_price = excluded.open_price,
-                            prev_close_price = excluded.prev_close_price,
-                            last_updated = CURRENT_TIMESTAMP
-                    `, [
-                        symbol, 
-                        priceData.price, 
-                        priceData.ask, 
-                        priceData.bid, 
-                        priceData.change, 
-                        priceData.changePercent,
-                        priceData.high_24h,
-                        priceData.low_24h,
-                        priceData.open_price,
-                        priceData.prev_close_price
-                    ], (err) => {
-                        if (err) {
-                            console.error(`❌ Failed to update ${symbol}:`, err.message);
-                        } else {
-                            logWithTimestamp(`✅ Updated ${symbol} price: $${priceData.price.toFixed(2)} (Ask: $${priceData.ask}, Bid: $${priceData.bid})`);
-                        }
-                    });
-                } else {
-                    logWithTimestamp(`📊 ${symbol} price unchanged: $${priceData.price.toFixed(2)}`);
-                }
-            });
-
-            // Add small delay between API calls to avoid rate limiting
-            await new Promise(resolve => setTimeout(resolve, 500));
+            // Check if price has changed
+            const existingPrice = await dbGet('SELECT price FROM prices WHERE metal = ?', [symbol]);
+            const hasChanged = !existingPrice || Math.abs(existingPrice.price - priceData.price) > 0.01;
             
+            if (hasChanged) {
+                await dbRun(`
+                    INSERT INTO prices (
+                        metal, price, ask_price, bid_price, change_24h, change_percent, 
+                        high_24h, low_24h, open_price, prev_close_price, last_updated
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(metal) DO UPDATE SET 
+                        price = excluded.price,
+                        ask_price = excluded.ask_price,
+                        bid_price = excluded.bid_price,
+                        change_24h = excluded.change_24h,
+                        change_percent = excluded.change_percent,
+                        high_24h = excluded.high_24h,
+                        low_24h = excluded.low_24h,
+                        open_price = excluded.open_price,
+                        prev_close_price = excluded.prev_close_price,
+                        last_updated = CURRENT_TIMESTAMP
+                `, [
+                    symbol, priceData.price, priceData.ask, priceData.bid, 
+                    priceData.change, priceData.changePercent, priceData.high_24h,
+                    priceData.low_24h, priceData.open_price, priceData.prev_close_price
+                ]);
+                
+                logWithTimestamp(`✅ Updated ${symbol}: $${priceData.price.toFixed(2)}`);
+                
+                // Clear response cache when prices update
+                responseCache.clear();
+            } else {
+                logWithTimestamp(`📊 ${symbol} unchanged: $${priceData.price.toFixed(2)}`);
+            }
+            
+            return { symbol, success: true };
         } catch (err) {
             console.error(`❌ Error updating ${symbol}:`, err.message);
+            return { symbol, success: false, error: err.message };
         }
-    }
+    });
     
-    logWithTimestamp('✅ Price update cycle completed');
+    const results = await Promise.allSettled(updatePromises);
+    const successful = results.filter(r => r.status === 'fulfilled' && r.value.success).length;
+    
+    logWithTimestamp(`✅ Update completed: ${successful}/${Object.keys(metals).length} successful`);
 }
 
-// Initialize database tables
+// ========== DATABASE INITIALIZATION ==========
+
 db.serialize(() => {
-    // Create or update prices table to include GoldAPI fields
+    // Create tables
     db.run(`CREATE TABLE IF NOT EXISTS prices (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         metal TEXT UNIQUE NOT NULL,
@@ -175,27 +341,6 @@ db.serialize(() => {
         prev_close_price REAL,
         last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
-
-    // Add missing columns to existing prices table (for database migration)
-    const columnsToAdd = [
-        'ask_price REAL',
-        'bid_price REAL', 
-        'high_24h REAL',
-        'low_24h REAL',
-        'open_price REAL',
-        'prev_close_price REAL'
-    ];
-
-    columnsToAdd.forEach(column => {
-        const columnName = column.split(' ')[0];
-        db.run(`ALTER TABLE prices ADD COLUMN ${column}`, (err) => {
-            if (err && !err.message.includes('duplicate column name')) {
-                console.error(`❌ Error adding column ${columnName}:`, err.message);
-            } else if (!err) {
-                logWithTimestamp(`✅ Added column ${columnName} to prices table`);
-            }
-        });
-    });
 
     db.run(`CREATE TABLE IF NOT EXISTS signals (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -250,31 +395,29 @@ db.serialize(() => {
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
 
-    // Initialize statistics if not exists
+    // Create indexes for better performance
+    db.run('CREATE INDEX IF NOT EXISTS idx_prices_metal ON prices(metal);');
+    db.run('CREATE INDEX IF NOT EXISTS idx_prices_updated ON prices(last_updated);');
+    db.run('CREATE INDEX IF NOT EXISTS idx_signals_active ON signals(active);');
+    db.run('CREATE INDEX IF NOT EXISTS idx_signals_created ON signals(created_at);');
+    db.run('CREATE INDEX IF NOT EXISTS idx_trade_history_created ON trade_history(created_at);');
+
+    // Initialize statistics
     db.get('SELECT COUNT(*) as count FROM trade_statistics', [], (err, row) => {
         if (!err && row.count === 0) {
-            db.run(`INSERT INTO trade_statistics (total_trades, win_trades, lose_trades, total_profit, win_rate) 
-                    VALUES (0, 0, 0, 0.0, 0.0)`);
+            db.run('INSERT INTO trade_statistics (total_trades, win_trades, lose_trades, total_profit, win_rate) VALUES (0, 0, 0, 0.0, 0.0)');
             logWithTimestamp('✅ Initialized trade statistics');
         }
     });
 });
 
-// Start price updates - Initial call and then every 15 seconds
-logWithTimestamp('🚀 Starting GoldAPI price monitoring...');
-updateAllMetalPrices();
-setInterval(updateAllMetalPrices, 15 * 1000); // 15 seconds interval
-
 // ========== ROUTES ==========
 
-// Get all metal prices
-app.get('/api/prices', (req, res) => {
-    db.all('SELECT * FROM prices ORDER BY last_updated DESC', [], (err, rows) => {
-        if (err) {
-            console.error('❌ Database error:', err);
-            return res.status(500).json({ error: 'Database error' });
-        }
-
+// Get all metal prices with caching
+app.get('/api/prices', cacheMiddleware(15000), async (req, res) => {
+    try {
+        const rows = await dbAll('SELECT * FROM prices ORDER BY last_updated DESC');
+        
         const prices = rows.reduce((acc, row) => {
             acc[row.metal] = {
                 price: row.price,
@@ -298,10 +441,13 @@ app.get('/api/prices', (req, res) => {
             prices,
             source: 'GoldAPI.io'
         });
-    });
+    } catch (err) {
+        console.error('❌ Database error:', err);
+        res.status(500).json({ error: 'Database error' });
+    }
 });
 
-// Get live metal price from GoldAPI
+// Get live metal price
 app.get('/api/metals/:symbol/price', async (req, res) => {
     try {
         const { symbol } = req.params;
@@ -328,19 +474,12 @@ app.get('/api/metals/:symbol/price', async (req, res) => {
     }
 });
 
-// Health check with GoldAPI status
+// Health check
 app.get('/api/health', async (req, res) => {
     let goldApiStatus = 'unknown';
     
     try {
-        // Test GoldAPI connectivity
-        await axios.get(`${GOLDAPI_BASE_URL}/XAU/USD`, {
-            headers: {
-                'x-access-token': GOLDAPI_KEY,
-                'Content-Type': 'application/json'
-            },
-            timeout: 5000
-        });
+        await goldApiClient.get('/XAU/USD', { timeout: 5000 });
         goldApiStatus = 'connected';
     } catch (error) {
         goldApiStatus = 'error';
@@ -356,19 +495,11 @@ app.get('/api/health', async (req, res) => {
     });
 });
 
-// ========== SIGNALS ROUTES ==========
-
-// Get all signals
-app.get('/api/signals', (req, res) => {
-    db.all(`
-        SELECT * FROM signals 
-        ORDER BY created_at DESC
-    `, [], (err, rows) => {
-        if (err) {
-            console.error('❌ Database error:', err);
-            return res.status(500).json({ error: 'Database error' });
-        }
-
+// Get all signals with caching
+app.get('/api/signals', cacheMiddleware(10000), async (req, res) => {
+    try {
+        const rows = await dbAll('SELECT * FROM signals ORDER BY created_at DESC');
+        
         logWithTimestamp(`📋 Retrieved ${rows.length} signals`);
         res.json({
             success: true,
@@ -376,150 +507,132 @@ app.get('/api/signals', (req, res) => {
             count: rows.length,
             timestamp: new Date().toISOString()
         });
-    });
+    } catch (err) {
+        console.error('❌ Database error:', err);
+        res.status(500).json({ error: 'Database error' });
+    }
 });
 
-// Add a new signal
-app.post('/api/signals', (req, res) => {
+// Add new signal
+app.post('/api/signals', async (req, res) => {
     const {
-        symbol,
-        trade_type,
-        entry_price,
-        target1,
-        target2,
-        target3,
-        stoploss,
-        send_notifications
+        symbol, trade_type, entry_price, target1, target2, target3,
+        stoploss, send_notifications
     } = req.body;
 
-    // Validation
     if (!symbol || !trade_type || !entry_price || !stoploss) {
         return res.status(400).json({
             error: 'Missing required fields: symbol, trade_type, entry_price, stoploss'
         });
     }
 
-    logWithTimestamp(`📤 Adding new signal: ${symbol} ${trade_type} at ${entry_price}`);
+    try {
+        logWithTimestamp(`📤 Adding new signal: ${symbol} ${trade_type} at ${entry_price}`);
 
-    db.run(`
-        INSERT INTO signals (
-            symbol, trade_type, entry_price, target1, target2, target3, 
-            stoploss, send_notifications, current_price, percentage_change
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `, [
-        symbol,
-        trade_type,
-        entry_price,
-        target1 || null,
-        target2 || null,
-        target3 || null,
-        stoploss,
-        send_notifications !== false,
-        entry_price,
-        0.0
-    ], function(err) {
-        if (err) {
-            console.error('❌ Error adding signal:', err);
-            return res.status(500).json({ error: 'Failed to add signal' });
-        }
+        const result = await dbRun(`
+            INSERT INTO signals (
+                symbol, trade_type, entry_price, target1, target2, target3, 
+                stoploss, send_notifications, current_price, percentage_change
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `, [
+            symbol, trade_type, entry_price, target1 || null, target2 || null,
+            target3 || null, stoploss, send_notifications !== false, entry_price, 0.0
+        ]);
 
-        logWithTimestamp(`✅ Signal added successfully with ID: ${this.lastID}`);
+        // Clear cache
+        responseCache.delete('/api/signals');
+
+        logWithTimestamp(`✅ Signal added successfully with ID: ${result.lastID}`);
         res.json({
             success: true,
             message: 'Signal added successfully',
-            signal_id: this.lastID,
+            signal_id: result.lastID,
             timestamp: new Date().toISOString()
         });
-    });
+    } catch (err) {
+        console.error('❌ Error adding signal:', err);
+        res.status(500).json({ error: 'Failed to add signal' });
+    }
 });
 
-// Update a signal
-app.put('/api/signals/:id', (req, res) => {
+// Update signal
+app.put('/api/signals/:id', async (req, res) => {
     const signalId = req.params.id;
     const {
-        target1_hit,
-        target2_hit,
-        target3_hit,
-        active,
-        current_price,
-        percentage_change
+        target1_hit, target2_hit, target3_hit, active,
+        current_price, percentage_change
     } = req.body;
 
-    logWithTimestamp(`📝 Updating signal ${signalId}`);
+    try {
+        logWithTimestamp(`📝 Updating signal ${signalId}`);
 
-    db.run(`
-        UPDATE signals SET
-            target1_hit = COALESCE(?, target1_hit),
-            target2_hit = COALESCE(?, target2_hit),
-            target3_hit = COALESCE(?, target3_hit),
-            active = COALESCE(?, active),
-            current_price = COALESCE(?, current_price),
-            percentage_change = COALESCE(?, percentage_change),
-            updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-    `, [
-        target1_hit,
-        target2_hit,
-        target3_hit,
-        active,
-        current_price,
-        percentage_change,
-        signalId
-    ], function(err) {
-        if (err) {
-            console.error('❌ Error updating signal:', err);
-            return res.status(500).json({ error: 'Failed to update signal' });
-        }
+        const result = await dbRun(`
+            UPDATE signals SET
+                target1_hit = COALESCE(?, target1_hit),
+                target2_hit = COALESCE(?, target2_hit),
+                target3_hit = COALESCE(?, target3_hit),
+                active = COALESCE(?, active),
+                current_price = COALESCE(?, current_price),
+                percentage_change = COALESCE(?, percentage_change),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+        `, [target1_hit, target2_hit, target3_hit, active, current_price, percentage_change, signalId]);
 
-        if (this.changes === 0) {
+        if (result.changes === 0) {
             return res.status(404).json({ error: 'Signal not found' });
         }
+
+        // Clear cache
+        responseCache.delete('/api/signals');
 
         logWithTimestamp(`✅ Signal ${signalId} updated successfully`);
         res.json({
             success: true,
             message: 'Signal updated successfully',
-            changes: this.changes,
+            changes: result.changes,
             timestamp: new Date().toISOString()
         });
-    });
+    } catch (err) {
+        console.error('❌ Error updating signal:', err);
+        res.status(500).json({ error: 'Failed to update signal' });
+    }
 });
 
-// Delete a signal
-app.delete('/api/signals/:id', (req, res) => {
+// Delete signal
+app.delete('/api/signals/:id', async (req, res) => {
     const signalId = req.params.id;
 
-    logWithTimestamp(`🗑️ Deleting signal ${signalId}`);
+    try {
+        logWithTimestamp(`🗑️ Deleting signal ${signalId}`);
 
-    db.run('DELETE FROM signals WHERE id = ?', [signalId], function(err) {
-        if (err) {
-            console.error('❌ Error deleting signal:', err);
-            return res.status(500).json({ error: 'Failed to delete signal' });
-        }
+        const result = await dbRun('DELETE FROM signals WHERE id = ?', [signalId]);
 
-        if (this.changes === 0) {
+        if (result.changes === 0) {
             return res.status(404).json({ error: 'Signal not found' });
         }
+
+        // Clear cache
+        responseCache.delete('/api/signals');
 
         logWithTimestamp(`✅ Signal ${signalId} deleted successfully`);
         res.json({
             success: true,
             message: 'Signal deleted successfully',
-            changes: this.changes,
+            changes: result.changes,
             timestamp: new Date().toISOString()
         });
-    });
+    } catch (err) {
+        console.error('❌ Error deleting signal:', err);
+        res.status(500).json({ error: 'Failed to delete signal' });
+    }
 });
 
-// Get a specific signal
-app.get('/api/signals/:id', (req, res) => {
+// Get specific signal
+app.get('/api/signals/:id', async (req, res) => {
     const signalId = req.params.id;
 
-    db.get('SELECT * FROM signals WHERE id = ?', [signalId], (err, row) => {
-        if (err) {
-            console.error('❌ Database error:', err);
-            return res.status(500).json({ error: 'Database error' });
-        }
+    try {
+        const row = await dbGet('SELECT * FROM signals WHERE id = ?', [signalId]);
 
         if (!row) {
             return res.status(404).json({ error: 'Signal not found' });
@@ -530,18 +643,16 @@ app.get('/api/signals/:id', (req, res) => {
             signal: row,
             timestamp: new Date().toISOString()
         });
-    });
+    } catch (err) {
+        console.error('❌ Database error:', err);
+        res.status(500).json({ error: 'Database error' });
+    }
 });
 
-// ========== STATISTICS ROUTES ==========
-
-// Get trade statistics
-app.get('/api/statistics', (req, res) => {
-    db.get('SELECT * FROM trade_statistics ORDER BY last_updated DESC LIMIT 1', [], (err, row) => {
-        if (err) {
-            console.error('❌ Database error:', err);
-            return res.status(500).json({ error: 'Database error' });
-        }
+// Get trade statistics with caching
+app.get('/api/statistics', cacheMiddleware(30000), async (req, res) => {
+    try {
+        const row = await dbGet('SELECT * FROM trade_statistics ORDER BY last_updated DESC LIMIT 1');
 
         if (!row) {
             const defaultStats = {
@@ -559,31 +670,25 @@ app.get('/api/statistics', (req, res) => {
             });
         }
 
-        logWithTimestamp(`📊 Retrieved trade statistics`);
+        logWithTimestamp('📊 Retrieved trade statistics');
         res.json({
             success: true,
             statistics: row,
             timestamp: new Date().toISOString()
         });
-    });
+    } catch (err) {
+        console.error('❌ Database error:', err);
+        res.status(500).json({ error: 'Database error' });
+    }
 });
 
-// Add trade result and update statistics
-app.post('/api/statistics/trade', (req, res) => {
+// Add trade result
+app.post('/api/statistics/trade', async (req, res) => {
     const {
-        signal_id,
-        symbol,
-        trade_type,
-        entry_price,
-        exit_price,
-        price_change,
-        percentage_change,
-        result,
-        pips,
-        closed_by = 'admin'
+        signal_id, symbol, trade_type, entry_price, exit_price,
+        price_change, percentage_change, result, pips, closed_by = 'admin'
     } = req.body;
 
-    // Validation
     if (!symbol || !trade_type || !entry_price || !exit_price || !result || pips === undefined) {
         return res.status(400).json({
             error: 'Missing required fields: symbol, trade_type, entry_price, exit_price, result, pips'
@@ -594,173 +699,166 @@ app.post('/api/statistics/trade', (req, res) => {
         return res.status(400).json({ error: 'Result must be either "profit" or "loss"' });
     }
 
-    logWithTimestamp(`📈 Adding trade result: ${symbol} ${result} ${pips} pips`);
+    try {
+        logWithTimestamp(`📈 Adding trade result: ${symbol} ${result} ${pips} pips`);
 
-    // Start transaction
-    db.serialize(() => {
-        db.run('BEGIN TRANSACTION');
+        // Start transaction
+        await dbRun('BEGIN TRANSACTION');
 
-        // Insert trade history record
-        db.run(`
+        // Insert trade history
+        const tradeResult = await dbRun(`
             INSERT INTO trade_history (
                 signal_id, symbol, trade_type, entry_price, exit_price, 
                 price_change, percentage_change, result, pips, closed_by
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `, [
-            signal_id,
-            symbol,
-            trade_type,
-            entry_price,
-            exit_price,
-            price_change,
-            percentage_change,
-            result,
-            pips,
-            closed_by
-        ], function(err) {
-            if (err) {
-                console.error('❌ Error adding trade history:', err);
-                db.run('ROLLBACK');
-                return res.status(500).json({ error: 'Failed to add trade history' });
-            }
+        `, [signal_id, symbol, trade_type, entry_price, exit_price, price_change, percentage_change, result, pips, closed_by]);
 
-            const tradeHistoryId = this.lastID;
+        // Get current statistics
+        const stats = await dbGet('SELECT * FROM trade_statistics ORDER BY last_updated DESC LIMIT 1');
+        const currentStats = stats || {
+            total_trades: 0,
+            win_trades: 0,
+            lose_trades: 0,
+            total_profit: 0.0
+        };
 
-            // Get current statistics
-            db.get('SELECT * FROM trade_statistics ORDER BY last_updated DESC LIMIT 1', [], (err, stats) => {
-                if (err) {
-                    console.error('❌ Error getting statistics:', err);
-                    db.run('ROLLBACK');
-                    return res.status(500).json({ error: 'Failed to get current statistics' });
-                }
+        // Calculate new statistics
+        const newTotalTrades = currentStats.total_trades + 1;
+        const newWinTrades = currentStats.win_trades + (result === 'profit' ? 1 : 0);
+        const newLoseTrades = currentStats.lose_trades + (result === 'loss' ? 1 : 0);
+        const newTotalProfit = currentStats.total_profit + (result === 'profit' ? pips : -pips);
+        const newWinRate = newTotalTrades > 0 ? (newWinTrades / newTotalTrades) * 100 : 0;
 
-                // Calculate new statistics
-                const currentStats = stats || {
-                    total_trades: 0,
-                    win_trades: 0,
-                    lose_trades: 0,
-                    total_profit: 0.0
-                };
+        // Update statistics
+        await dbRun(`
+            INSERT OR REPLACE INTO trade_statistics (
+                id, total_trades, win_trades, lose_trades, total_profit, win_rate, last_updated
+            ) VALUES (
+                COALESCE((SELECT id FROM trade_statistics ORDER BY last_updated DESC LIMIT 1), 1),
+                ?, ?, ?, ?, ?, CURRENT_TIMESTAMP
+            )
+        `, [newTotalTrades, newWinTrades, newLoseTrades, newTotalProfit, newWinRate]);
 
-                const newTotalTrades = currentStats.total_trades + 1;
-                const newWinTrades = currentStats.win_trades + (result === 'profit' ? 1 : 0);
-                const newLoseTrades = currentStats.lose_trades + (result === 'loss' ? 1 : 0);
-                const newTotalProfit = currentStats.total_profit + (result === 'profit' ? pips : -pips);
-                const newWinRate = newTotalTrades > 0 ? (newWinTrades / newTotalTrades) * 100 : 0;
+        // Commit transaction
+        await dbRun('COMMIT');
 
-                // Update statistics
-                db.run(`
-                    INSERT OR REPLACE INTO trade_statistics (
-                        id, total_trades, win_trades, lose_trades, total_profit, win_rate, last_updated
-                    ) VALUES (
-                        COALESCE((SELECT id FROM trade_statistics ORDER BY last_updated DESC LIMIT 1), 1),
-                        ?, ?, ?, ?, ?, CURRENT_TIMESTAMP
-                    )
-                `, [
-                    newTotalTrades,
-                    newWinTrades,
-                    newLoseTrades,
-                    newTotalProfit,
-                    newWinRate
-                ], function(err) {
-                    if (err) {
-                        console.error('❌ Error updating statistics:', err);
-                        db.run('ROLLBACK');
-                        return res.status(500).json({ error: 'Failed to update statistics' });
-                    }
+        // Clear cache
+        responseCache.delete('/api/statistics');
+        responseCache.delete('/api/statistics/history');
 
-                    // Commit transaction
-                    db.run('COMMIT', (err) => {
-                        if (err) {
-                            console.error('❌ Error committing transaction:', err);
-                            return res.status(500).json({ error: 'Failed to commit changes' });
-                        }
-
-                        logWithTimestamp(`✅ Trade result added and statistics updated`);
-                        res.json({
-                            success: true,
-                            message: 'Trade result added and statistics updated successfully',
-                            trade_history_id: tradeHistoryId,
-                            statistics: {
-                                total_trades: newTotalTrades,
-                                win_trades: newWinTrades,
-                                lose_trades: newLoseTrades,
-                                total_profit: newTotalProfit,
-                                win_rate: newWinRate
-                            },
-                            timestamp: new Date().toISOString()
-                        });
-                    });
-                });
-            });
+        logWithTimestamp('✅ Trade result added and statistics updated');
+        res.json({
+            success: true,
+            message: 'Trade result added and statistics updated successfully',
+            trade_history_id: tradeResult.lastID,
+            statistics: {
+                total_trades: newTotalTrades,
+                win_trades: newWinTrades,
+                lose_trades: newLoseTrades,
+                total_profit: newTotalProfit,
+                win_rate: newWinRate
+            },
+            timestamp: new Date().toISOString()
         });
-    });
+    } catch (err) {
+        await dbRun('ROLLBACK');
+        console.error('❌ Error adding trade result:', err);
+        res.status(500).json({ error: 'Failed to add trade result' });
+    }
 });
 
-// Get trade history
-app.get('/api/statistics/history', (req, res) => {
+// Get trade history with caching
+app.get('/api/statistics/history', cacheMiddleware(60000), async (req, res) => {
     const { limit = 50, offset = 0 } = req.query;
 
-    db.all(`
-        SELECT * FROM trade_history 
-        ORDER BY created_at DESC 
-        LIMIT ? OFFSET ?
-    `, [parseInt(limit), parseInt(offset)], (err, rows) => {
-        if (err) {
-            console.error('❌ Database error:', err);
-            return res.status(500).json({ error: 'Database error' });
-        }
+    try {
+        const rows = await dbAll(`
+            SELECT * FROM trade_history 
+            ORDER BY created_at DESC 
+            LIMIT ? OFFSET ?
+        `, [parseInt(limit), parseInt(offset)]);
 
-        // Get total count
-        db.get('SELECT COUNT(*) as total FROM trade_history', [], (err, countRow) => {
-            if (err) {
-                console.error('❌ Database error:', err);
-                return res.status(500).json({ error: 'Database error' });
-            }
+        const countRow = await dbGet('SELECT COUNT(*) as total FROM trade_history');
 
-            logWithTimestamp(`📋 Retrieved ${rows.length} trade history records`);
-            res.json({
-                success: true,
-                history: rows,
-                count: rows.length,
-                total: countRow.total,
-                timestamp: new Date().toISOString()
-            });
+        logWithTimestamp(`📋 Retrieved ${rows.length} trade history records`);
+        res.json({
+            success: true,
+            history: rows,
+            count: rows.length,
+            total: countRow.total,
+            timestamp: new Date().toISOString()
         });
-    });
+    } catch (err) {
+        console.error('❌ Database error:', err);
+        res.status(500).json({ error: 'Database error' });
+    }
 });
 
+// ========== PRICE MONITORING ==========
+
+logWithTimestamp('🚀 Starting optimized GoldAPI price monitoring...');
+updateAllMetalPrices();
+setInterval(updateAllMetalPrices, 15 * 1000);
+
 // ========== START SERVER ==========
-app.listen(PORT, '0.0.0.0', () => {
-    console.log('🚀 Enhanced Gold Tracker API Server with GoldAPI.io Started');
+
+const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log('🚀 Optimized Gold Tracker API Server Started');
     console.log(`🌐 Server running on http://0.0.0.0:${PORT}`);
+    console.log('🔧 Optimizations enabled:');
+    console.log('   ✅ Response compression');
+    console.log('   ✅ Connection pooling');
+    console.log('   ✅ Request caching');
+    console.log('   ✅ Database indexing');
+    console.log('   ✅ Parallel processing');
+    console.log('   ✅ Request timeouts');
     console.log('🔑 Using GoldAPI.io for real-time precious metals prices');
     console.log('⏰ Price updates every 15 seconds');
-    console.log('📡 Available endpoints:');
-    console.log('   📊 Prices:');
-    console.log('      GET  /api/prices - Get all metal prices');
-    console.log('      GET  /api/metals/{symbol}/price - Get specific metal price');
-    console.log('   📈 Signals:');
-    console.log('      GET  /api/signals - Get all signals');
-    console.log('      POST /api/signals - Add new signal');
-    console.log('      PUT  /api/signals/{id} - Update signal');
-    console.log('      DELETE /api/signals/{id} - Delete signal');
-    console.log('      GET  /api/signals/{id} - Get specific signal');
-    console.log('   📊 Statistics:');
-    console.log('      GET  /api/statistics - Get trade statistics');
-    console.log('      POST /api/statistics/trade - Add trade result');
-    console.log('      GET  /api/statistics/history - Get trade history');
-    console.log('   🔧 System:');
-    console.log('      GET  /api/health - Health check');
     console.log(`📋 Supported metals: ${Object.keys(metals).join(', ')}`);
 });
 
-// ========== SHUTDOWN ==========
+// Server timeout configuration
+server.timeout = 30000; // 30 seconds
+server.keepAliveTimeout = 5000; // 5 seconds
+server.headersTimeout = 60000; // 60 seconds
+
+// ========== SHUTDOWN HANDLING ==========
+
 process.on('SIGINT', () => {
     console.log('\n🛑 Shutting down gracefully...');
-    db.close((err) => {
-        if (err) console.error('❌ Error closing database:', err.message);
-        else console.log('💾 Database connection closed');
-        process.exit(0);
+    
+    server.close(() => {
+        console.log('🌐 HTTP server closed');
+        
+        db.close((err) => {
+            if (err) console.error('❌ Error closing database:', err.message);
+            else console.log('💾 Database connection closed');
+            process.exit(0);
+        });
     });
+});
+
+process.on('SIGTERM', () => {
+    console.log('🛑 SIGTERM received, shutting down gracefully...');
+    
+    server.close(() => {
+        console.log('🌐 HTTP server closed');
+        
+        db.close((err) => {
+            if (err) console.error('❌ Error closing database:', err.message);
+            else console.log('💾 Database connection closed');
+            process.exit(0);
+        });
+    });
+});
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (err) => {
+    console.error('❌ Uncaught Exception:', err);
+    process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
+    process.exit(1);
 });
