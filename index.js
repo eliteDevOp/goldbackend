@@ -8,127 +8,38 @@ const compression = require('compression');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ========== ENHANCED MIDDLEWARE ==========
+// ========== BASIC MIDDLEWARE ==========
 app.use(compression({ 
-    level: 6, // Balanced compression
-    threshold: 1024 // Only compress responses > 1KB
+    level: 6,
+    threshold: 1024
 }));
 
-// Enhanced CORS for global access
 app.use(cors({
     origin: true,
     credentials: false,
-    maxAge: 86400 // Cache preflight for 24 hours
+    maxAge: 86400
 }));
 
-app.use(express.json({ limit: '1mb' })); // Reduced from 10mb
+app.use(express.json({ limit: '1mb' }));
 
-// Aggressive timeout for global users
+// Simple timeout handling
 app.use((req, res, next) => {
-    req.setTimeout(8000, () => { // Reduced from 30s to 8s
-        res.status(408).json({ 
-            error: 'Request timeout',
-            cached: true // Indicate this might be cached data
-        });
+    req.setTimeout(15000, () => {
+        if (!res.headersSent) {
+            res.status(408).json({ 
+                error: 'Request timeout'
+            });
+        }
     });
     
-    // Set response headers for better caching
     res.set({
-        'Cache-Control': 'public, max-age=10, stale-while-revalidate=30',
         'X-Content-Type-Options': 'nosniff',
-        'X-Frame-Options': 'DENY'
+        'X-Frame-Options': 'DENY',
+        'Connection': 'keep-alive'
     });
     
     next();
 });
-
-// ========== ENHANCED CACHING SYSTEM ==========
-const cache = new Map();
-const CACHE_DURATION = {
-    prices: 8 * 1000,      // 8 seconds (faster refresh)
-    signals: 3 * 1000,     // 3 seconds
-    statistics: 20 * 1000, // 20 seconds
-    history: 60 * 1000,    // 1 minute
-    health: 5 * 1000       // 5 seconds for health
-};
-
-// Persistent cache for fallback data
-const persistentCache = new Map();
-
-function getCacheKey(req) {
-    const baseKey = `${req.method}:${req.path}`;
-    const queryKey = Object.keys(req.query).length > 0 ? `:${JSON.stringify(req.query)}` : '';
-    return baseKey + queryKey;
-}
-
-function getFromCache(key) {
-    const cached = cache.get(key);
-    if (cached && Date.now() - cached.timestamp < cached.duration) {
-        return cached.data;
-    }
-    return null;
-}
-
-function setCache(key, data, duration) {
-    // Aggressive cache management
-    if (cache.size > 50) { // Reduced from 100
-        const oldKeys = Array.from(cache.keys()).slice(0, 25);
-        oldKeys.forEach(k => cache.delete(k));
-    }
-    
-    cache.set(key, {
-        data,
-        timestamp: Date.now(),
-        duration
-    });
-    
-    // Store in persistent cache for fallback
-    persistentCache.set(key, {
-        data,
-        timestamp: Date.now()
-    });
-}
-
-// Enhanced cache middleware with fallback
-function cacheMiddleware(duration) {
-    return (req, res, next) => {
-        const cacheKey = getCacheKey(req);
-        const cached = getFromCache(cacheKey);
-        
-        if (cached) {
-            res.set('X-Cache', 'HIT');
-            return res.json(cached);
-        }
-        
-        const originalJson = res.json;
-        const originalSend = res.send;
-        
-        res.json = function(data) {
-            if (res.statusCode === 200) {
-                setCache(cacheKey, data, duration);
-                res.set('X-Cache', 'MISS');
-            }
-            originalJson.call(this, data);
-        };
-        
-        // Timeout fallback
-        const timeoutId = setTimeout(() => {
-            const fallback = persistentCache.get(cacheKey);
-            if (fallback && !res.headersSent) {
-                res.set('X-Cache', 'STALE');
-                res.set('X-Data-Age', Math.floor((Date.now() - fallback.timestamp) / 1000));
-                return res.json({
-                    ...fallback.data,
-                    _stale: true,
-                    _age: Math.floor((Date.now() - fallback.timestamp) / 1000)
-                });
-            }
-        }, 6000); // 6-second fallback
-        
-        res.on('finish', () => clearTimeout(timeoutId));
-        next();
-    };
-}
 
 // ========== DATABASE SETUP ==========
 const dbPath = path.join(__dirname, 'gold_tracker.db');
@@ -137,49 +48,24 @@ const db = new sqlite3.Database(dbPath);
 // Enhanced SQLite performance
 db.run('PRAGMA journal_mode = WAL');
 db.run('PRAGMA synchronous = NORMAL');
-db.run('PRAGMA cache_size = 20000'); // Increased cache
+db.run('PRAGMA cache_size = 20000');
 db.run('PRAGMA temp_store = memory');
-db.run('PRAGMA mmap_size = 268435456'); // 256MB memory map
+db.run('PRAGMA mmap_size = 268435456');
 db.run('PRAGMA optimize');
 
-// Connection pooling simulation
-let dbBusy = false;
-const dbQueue = [];
-
+// Simple database query function
 function executeQuery(query, params = []) {
     return new Promise((resolve, reject) => {
-        const task = { query, params, resolve, reject };
+        const isSelect = query.trim().toUpperCase().startsWith('SELECT');
+        const method = isSelect ? 'all' : 'run';
         
-        if (dbBusy) {
-            dbQueue.push(task);
-            return;
-        }
-        
-        executeTask(task);
-    });
-}
-
-function executeTask(task) {
-    dbBusy = true;
-    const { query, params, resolve, reject } = task;
-    
-    const isSelect = query.trim().toUpperCase().startsWith('SELECT');
-    const method = isSelect ? 'all' : 'run';
-    
-    db[method](query, params, function(err, result) {
-        dbBusy = false;
-        
-        if (err) {
-            reject(err);
-        } else {
-            resolve(isSelect ? result : { changes: this.changes, lastID: this.lastID });
-        }
-        
-        // Process next in queue
-        if (dbQueue.length > 0) {
-            const nextTask = dbQueue.shift();
-            executeTask(nextTask);
-        }
+        db[method](query, params, function(err, result) {
+            if (err) {
+                reject(err);
+            } else {
+                resolve(isSelect ? result : { changes: this.changes, lastID: this.lastID });
+            }
+        });
     });
 }
 
@@ -193,9 +79,9 @@ const metals = {
     'XPD': 'XPD/USD'
 };
 
-// Aggressive axios configuration for global users
+// Axios configuration
 const axiosConfig = {
-    timeout: 4000, // Reduced from 10s to 4s
+    timeout: 6000,
     headers: {
         'x-access-token': GOLDAPI_KEY,
         'Content-Type': 'application/json',
@@ -203,44 +89,22 @@ const axiosConfig = {
         'Connection': 'keep-alive'
     },
     maxRedirects: 2,
-    validateStatus: status => status < 500 // Accept 4xx as valid
+    validateStatus: status => status < 500
 };
 
-// Create axios instance with interceptors
 const goldApi = axios.create(axiosConfig);
 
-// Request interceptor for logging
-goldApi.interceptors.request.use(config => {
-    config.metadata = { startTime: Date.now() };
-    return config;
-});
-
-// Response interceptor for monitoring
-goldApi.interceptors.response.use(
-    response => {
-        const duration = Date.now() - response.config.metadata.startTime;
-        console.log(`✅ GoldAPI call: ${duration}ms`);
-        return response;
-    },
-    error => {
-        const duration = Date.now() - error.config.metadata.startTime;
-        console.log(`❌ GoldAPI failed: ${duration}ms - ${error.message}`);
-        return Promise.reject(error);
-    }
-);
-
-// Enhanced price fetching with circuit breaker
-let circuitBreakerState = 'CLOSED'; // CLOSED, OPEN, HALF_OPEN
+// Circuit breaker for API reliability
+let circuitBreakerState = 'CLOSED';
 let failureCount = 0;
 let lastFailureTime = 0;
 const FAILURE_THRESHOLD = 3;
-const RECOVERY_TIMEOUT = 30000; // 30 seconds
+const RECOVERY_TIMEOUT = 30000;
 
 async function fetchMetalPrice(metalSymbol, retries = 1) {
     const endpoint = metals[metalSymbol];
     if (!endpoint) throw new Error(`Unsupported metal symbol: ${metalSymbol}`);
 
-    // Circuit breaker check
     if (circuitBreakerState === 'OPEN') {
         if (Date.now() - lastFailureTime > RECOVERY_TIMEOUT) {
             circuitBreakerState = 'HALF_OPEN';
@@ -254,7 +118,6 @@ async function fetchMetalPrice(metalSymbol, retries = 1) {
             const response = await goldApi.get(`${GOLDAPI_BASE_URL}/${endpoint}`);
             const data = response.data;
             
-            // Reset circuit breaker on success
             if (circuitBreakerState === 'HALF_OPEN') {
                 circuitBreakerState = 'CLOSED';
                 failureCount = 0;
@@ -299,7 +162,7 @@ async function fetchMetalPrice(metalSymbol, retries = 1) {
     }
 }
 
-// Batch update with better error handling
+// Price update function
 async function updateAllMetalPrices() {
     const startTime = Date.now();
     console.log('🔄 Starting price update...');
@@ -329,15 +192,6 @@ async function updateAllMetalPrices() {
 
         await Promise.allSettled(updatePromises);
         
-        // Clear only price-related cache
-        const keysToDelete = [];
-        for (const [key] of cache.entries()) {
-            if (key.includes('/api/prices')) {
-                keysToDelete.push(key);
-            }
-        }
-        keysToDelete.forEach(key => cache.delete(key));
-        
         const duration = Date.now() - startTime;
         console.log(`✅ Price update completed in ${duration}ms`);
         
@@ -348,7 +202,6 @@ async function updateAllMetalPrices() {
 
 // ========== DATABASE INITIALIZATION ==========
 db.serialize(() => {
-    // Create tables with optimized indexes
     db.run(`CREATE TABLE IF NOT EXISTS prices (
         metal TEXT PRIMARY KEY,
         price REAL NOT NULL,
@@ -383,9 +236,10 @@ db.serialize(() => {
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
 
-    // Optimized indexes
+    // Optimized indexes for faster signal queries
     db.run('CREATE INDEX IF NOT EXISTS idx_signals_active_created ON signals(active, created_at DESC)');
     db.run('CREATE INDEX IF NOT EXISTS idx_signals_symbol_active ON signals(symbol, active)');
+    db.run('CREATE INDEX IF NOT EXISTS idx_signals_created ON signals(created_at DESC)');
 
     db.run(`CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -431,64 +285,17 @@ db.serialize(() => {
     });
 });
 
-// Start price updates with better scheduling
+// Start price updates
 console.log('🚀 Starting price monitoring...');
 updateAllMetalPrices();
-setInterval(updateAllMetalPrices, 10 * 1000); // Every 10 seconds
+setInterval(updateAllMetalPrices, 12 * 1000); // Every 12 seconds
 
-// ========== OPTIMIZED ROUTES ==========
+// ========== API ROUTES ==========
 
-// Ultra-lightweight price endpoint
-app.get('/api/prices/ultra-light', cacheMiddleware(CACHE_DURATION.prices), async (req, res) => {
+// Simple prices endpoint
+app.get('/api/prices', async (req, res) => {
     try {
-        const rows = await executeQuery('SELECT metal, price, change_percent FROM prices ORDER BY metal');
-        
-        const prices = {};
-        rows.forEach(row => {
-            prices[row.metal] = [row.price, row.change_percent]; // Array format for minimal payload
-        });
-
-        res.json({
-            t: Date.now(),
-            d: prices
-        });
-    } catch (err) {
-        res.status(500).json({ error: 'Database error' });
-    }
-});
-
-// Enhanced light price endpoint
-app.get('/api/prices/light', cacheMiddleware(CACHE_DURATION.prices), async (req, res) => {
-    try {
-        const rows = await executeQuery(`
-            SELECT metal, price, change_percent, last_updated 
-            FROM prices 
-            ORDER BY metal
-        `);
-
-        const lightPrices = {};
-        rows.forEach(row => {
-            lightPrices[row.metal] = {
-                p: row.price,
-                c: row.change_percent,
-                u: row.last_updated
-            };
-        });
-
-        res.json({
-            s: true,
-            t: Date.now(),
-            d: lightPrices,
-            cb: circuitBreakerState // Circuit breaker status
-        });
-    } catch (err) {
-        res.status(500).json({ error: 'Database error' });
-    }
-});
-
-// Full price endpoint with enhanced caching
-app.get('/api/prices', cacheMiddleware(CACHE_DURATION.prices), async (req, res) => {
-    try {
+        const startTime = Date.now();
         const rows = await executeQuery('SELECT * FROM prices ORDER BY metal');
 
         const prices = {};
@@ -507,6 +314,9 @@ app.get('/api/prices', cacheMiddleware(CACHE_DURATION.prices), async (req, res) 
             };
         });
 
+        const responseTime = Date.now() - startTime;
+        res.set('X-Response-Time', `${responseTime}ms`);
+
         res.json({
             success: true,
             timestamp: Date.now(),
@@ -515,40 +325,70 @@ app.get('/api/prices', cacheMiddleware(CACHE_DURATION.prices), async (req, res) 
             circuit_breaker: circuitBreakerState
         });
     } catch (err) {
+        console.error('❌ Prices error:', err);
         res.status(500).json({ error: 'Database error' });
     }
 });
 
-// Optimized signals with better pagination
-app.get('/api/signals', cacheMiddleware(CACHE_DURATION.signals), async (req, res) => {
+// OPTIMIZED SIGNALS ENDPOINT - No caching, no pagination
+app.get('/api/signals', async (req, res) => {
     try {
-        const { page = 1, limit = 20, active_only = 'false' } = req.query;
-        const offset = (parseInt(page) - 1) * parseInt(limit);
+        const startTime = Date.now();
         
-        let query = 'SELECT * FROM signals';
-        let countQuery = 'SELECT COUNT(*) as total FROM signals';
+        // Simple query with optimized fields selection
+        const { active_only = 'false' } = req.query;
+        
+        let query = `
+            SELECT id, symbol, trade_type, entry_price, current_price, percentage_change,
+                   target1, target2, target3, target1_hit, target2_hit, target3_hit,
+                   stoploss, active, created_at, updated_at
+            FROM signals
+        `;
+        
+        let params = [];
         
         if (active_only === 'true') {
             query += ' WHERE active = 1';
-            countQuery += ' WHERE active = 1';
         }
         
-        query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
+        // Order by most recent first with limit for mobile performance
+        query += ' ORDER BY created_at DESC LIMIT 100';
 
-        const [countResult, rows] = await Promise.all([
-            executeQuery(countQuery),
-            executeQuery(query, [parseInt(limit), offset])
-        ]);
-
+        const rows = await executeQuery(query, params);
+        
+        const responseTime = Date.now() - startTime;
+        res.set('X-Response-Time', `${responseTime}ms`);
+        
         res.json({
             success: true,
             signals: rows,
-            pagination: {
-                page: parseInt(page),
-                limit: parseInt(limit),
-                total: countResult[0].total,
-                pages: Math.ceil(countResult[0].total / parseInt(limit))
-            },
+            count: rows.length,
+            timestamp: Date.now(),
+            response_time_ms: responseTime
+        });
+        
+    } catch (err) {
+        console.error('❌ Signals error:', err);
+        res.status(500).json({ 
+            error: 'Database error',
+            timestamp: Date.now()
+        });
+    }
+});
+
+// Get single signal
+app.get('/api/signals/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const rows = await executeQuery('SELECT * FROM signals WHERE id = ?', [id]);
+        
+        if (rows.length === 0) {
+            return res.status(404).json({ error: 'Signal not found' });
+        }
+
+        res.json({
+            success: true,
+            signal: rows[0],
             timestamp: Date.now()
         });
     } catch (err) {
@@ -556,8 +396,8 @@ app.get('/api/signals', cacheMiddleware(CACHE_DURATION.signals), async (req, res
     }
 });
 
-// Optimized single metal price with fallback
-app.get('/api/metals/:symbol/price', cacheMiddleware(CACHE_DURATION.prices), async (req, res) => {
+// Single metal price
+app.get('/api/metals/:symbol/price', async (req, res) => {
     try {
         const { symbol } = req.params;
         if (!metals[symbol]) {
@@ -567,12 +407,11 @@ app.get('/api/metals/:symbol/price', cacheMiddleware(CACHE_DURATION.prices), asy
             });
         }
 
-        // Try database first
         const rows = await executeQuery('SELECT * FROM prices WHERE metal = ?', [symbol]);
         const row = rows[0];
 
-        if (row && (Date.now() - new Date(row.last_updated).getTime()) < 20000) {
-            return res.json({
+        if (row) {
+            res.json({
                 success: true,
                 symbol,
                 price: row.price,
@@ -581,37 +420,25 @@ app.get('/api/metals/:symbol/price', cacheMiddleware(CACHE_DURATION.prices), asy
                 change: row.change_24h,
                 changePercent: row.change_percent,
                 timestamp: Date.now(),
-                source: 'cached'
+                last_updated: row.last_updated
             });
-        }
-
-        // Try to fetch fresh data
-        try {
-            const data = await fetchMetalPrice(symbol);
-            res.json({
-                success: true,
-                symbol,
-                ...data,
-                timestamp: Date.now(),
-                source: 'live'
-            });
-        } catch (fetchError) {
-            // Fallback to any cached data
-            if (row) {
-                return res.json({
+        } else {
+            // Try to fetch fresh data
+            try {
+                const data = await fetchMetalPrice(symbol);
+                res.json({
                     success: true,
                     symbol,
-                    price: row.price,
-                    ask: row.ask_price,
-                    bid: row.bid_price,
-                    change: row.change_24h,
-                    changePercent: row.change_percent,
+                    ...data,
                     timestamp: Date.now(),
-                    source: 'fallback',
-                    warning: 'Live data unavailable'
+                    source: 'live'
+                });
+            } catch (fetchError) {
+                res.status(500).json({ 
+                    error: fetchError.message,
+                    timestamp: Date.now()
                 });
             }
-            throw fetchError;
         }
     } catch (err) {
         res.status(500).json({ 
@@ -621,8 +448,8 @@ app.get('/api/metals/:symbol/price', cacheMiddleware(CACHE_DURATION.prices), asy
     }
 });
 
-// Enhanced statistics endpoint
-app.get('/api/statistics', cacheMiddleware(CACHE_DURATION.statistics), async (req, res) => {
+// Statistics endpoint
+app.get('/api/statistics', async (req, res) => {
     try {
         const rows = await executeQuery(`
             SELECT total_trades, win_trades, lose_trades, total_profit, win_rate, last_updated 
@@ -650,37 +477,32 @@ app.get('/api/statistics', cacheMiddleware(CACHE_DURATION.statistics), async (re
     }
 });
 
-// Optimized trade history
-app.get('/api/statistics/history', cacheMiddleware(CACHE_DURATION.history), async (req, res) => {
+// Trade history
+app.get('/api/statistics/history', async (req, res) => {
     try {
-        const { limit = 20, offset = 0, symbol } = req.query;
+        const { limit = 50, symbol } = req.query;
         
         let query = `
             SELECT id, symbol, trade_type, entry_price, exit_price, 
                    percentage_change, result, pips, created_at 
             FROM trade_history
         `;
-        let countQuery = 'SELECT COUNT(*) as total FROM trade_history';
         let params = [];
         
         if (symbol) {
             query += ' WHERE symbol = ?';
-            countQuery += ' WHERE symbol = ?';
             params.push(symbol);
         }
         
-        query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
+        query += ' ORDER BY created_at DESC LIMIT ?';
+        params.push(parseInt(limit));
         
-        const [countResult, rows] = await Promise.all([
-            executeQuery(countQuery, symbol ? [symbol] : []),
-            executeQuery(query, [...params, parseInt(limit), parseInt(offset)])
-        ]);
+        const rows = await executeQuery(query, params);
 
         res.json({
             success: true,
             history: rows,
             count: rows.length,
-            total: countResult[0].total,
             timestamp: Date.now()
         });
     } catch (err) {
@@ -688,13 +510,11 @@ app.get('/api/statistics/history', cacheMiddleware(CACHE_DURATION.history), asyn
     }
 });
 
-// Enhanced health check
-app.get('/api/health', cacheMiddleware(CACHE_DURATION.health), (req, res) => {
+// Health check
+app.get('/api/health', (req, res) => {
     res.json({
         status: 'healthy',
         timestamp: Date.now(),
-        cache_size: cache.size,
-        persistent_cache_size: persistentCache.size,
         circuit_breaker: circuitBreakerState,
         uptime: Math.floor(process.uptime()),
         memory: {
@@ -704,7 +524,7 @@ app.get('/api/health', cacheMiddleware(CACHE_DURATION.health), (req, res) => {
     });
 });
 
-// Enhanced signal creation
+// Create signal
 app.post('/api/signals', async (req, res) => {
     try {
         const {
@@ -727,26 +547,18 @@ app.post('/api/signals', async (req, res) => {
             target3 || null, stoploss, send_notifications !== false, entry_price, 0.0
         ]);
 
-        // Clear signals cache
-        const keysToDelete = [];
-        for (const [key] of cache.entries()) {
-            if (key.includes('/api/signals')) {
-                keysToDelete.push(key);
-            }
-        }
-        keysToDelete.forEach(key => cache.delete(key));
-
         res.json({
             success: true,
             signal_id: result.lastID,
             timestamp: Date.now()
         });
     } catch (err) {
+        console.error('❌ Create signal error:', err);
         res.status(500).json({ error: 'Failed to add signal' });
     }
 });
 
-// Enhanced signal update
+// Update signal
 app.put('/api/signals/:id', async (req, res) => {
     try {
         const signalId = req.params.id;
@@ -776,9 +588,6 @@ app.put('/api/signals/:id', async (req, res) => {
             return res.status(404).json({ error: 'Signal not found' });
         }
 
-        // Clear cache
-        cache.clear();
-
         res.json({
             success: true,
             changes: result.changes,
@@ -792,19 +601,6 @@ app.put('/api/signals/:id', async (req, res) => {
 // Error handling middleware
 app.use((err, req, res, next) => {
     console.error('❌ Unhandled error:', err);
-    
-    // Try to send cached data if available
-    const cacheKey = getCacheKey(req);
-    const fallback = persistentCache.get(cacheKey);
-    
-    if (fallback && !res.headersSent) {
-        res.set('X-Cache', 'ERROR_FALLBACK');
-        return res.json({
-            ...fallback.data,
-            _error_fallback: true,
-            _age: Math.floor((Date.now() - fallback.timestamp) / 1000)
-        });
-    }
     
     if (!res.headersSent) {
         res.status(500).json({ 
@@ -824,27 +620,26 @@ app.use((req, res) => {
 
 // ========== START SERVER ==========
 app.listen(PORT, '0.0.0.0', () => {
-    console.log('🚀 Enhanced Gold Tracker API Server Started');
+    console.log('🚀 Simplified Gold Tracker API Server Started');
     console.log(`🌐 Server: http://0.0.0.0:${PORT}`);
-    console.log('⚡ Global Optimizations:');
-    console.log('   🔄 Circuit breaker pattern');
-    console.log('   📦 Enhanced compression');
-    console.log('   ⚡ Aggressive caching');
-    console.log('   🗄️ Connection pooling');
-    console.log('   📱 Ultra-light endpoints');
-    console.log('   🛡️ Fallback mechanisms');
-    console.log('   ⏱️ Reduced timeouts');
-    console.log('   🔄 Retry mechanisms');
-    console.log('\n📡 New optimized endpoints:');
-    console.log('   GET  /api/prices/light - Minimal price data');
-    console.log('   GET  /api/signals?page=1&limit=20 - Paginated signals');
-    console.log('   GET  /api/statistics/history?limit=20 - Paginated history');
+    console.log('⚡ Optimizations:');
+    console.log('   🗄️ Enhanced database indexes');
+    console.log('   📱 Simplified signal loading');
+    console.log('   ⚡ No caching overhead');
+    console.log('   📊 Direct database queries');
+    console.log('   🛡️ Circuit breaker for API calls');
+    console.log('   ⏱️ Response time tracking');
+    console.log('\n📡 Available endpoints:');
+    console.log('   GET  /api/signals - All signals (up to 100)');
+    console.log('   GET  /api/signals?active_only=true - Active signals only');
+    console.log('   GET  /api/prices - All metal prices');
+    console.log('   POST /api/signals - Create new signal');
+    console.log('   PUT  /api/signals/:id - Update signal');
 });
 
 // ========== GRACEFUL SHUTDOWN ==========
 process.on('SIGINT', () => {
     console.log('\n🛑 Shutting down gracefully...');
-    cache.clear();
     db.close((err) => {
         if (err) console.error('❌ Error closing database:', err.message);
         else console.log('💾 Database connection closed');
