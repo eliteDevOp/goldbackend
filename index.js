@@ -3,36 +3,62 @@ const sqlite3 = require('sqlite3').verbose();
 const axios = require('axios');
 const cors = require('cors');
 const path = require('path');
-const compression = require('compression'); // Add this dependency
+const compression = require('compression');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ========== MIDDLEWARE ==========
-app.use(compression()); // Enable gzip compression
-app.use(cors());
-app.use(express.json({ limit: '10mb' }));
+// ========== ENHANCED MIDDLEWARE ==========
+app.use(compression({ 
+    level: 6, // Balanced compression
+    threshold: 1024 // Only compress responses > 1KB
+}));
 
-// Request timeout middleware
+// Enhanced CORS for global access
+app.use(cors({
+    origin: true,
+    credentials: false,
+    maxAge: 86400 // Cache preflight for 24 hours
+}));
+
+app.use(express.json({ limit: '1mb' })); // Reduced from 10mb
+
+// Aggressive timeout for global users
 app.use((req, res, next) => {
-    // Set timeout for requests (30 seconds)
-    req.setTimeout(30000, () => {
-        res.status(408).json({ error: 'Request timeout' });
+    req.setTimeout(8000, () => { // Reduced from 30s to 8s
+        res.status(408).json({ 
+            error: 'Request timeout',
+            cached: true // Indicate this might be cached data
+        });
     });
+    
+    // Set response headers for better caching
+    res.set({
+        'Cache-Control': 'public, max-age=10, stale-while-revalidate=30',
+        'X-Content-Type-Options': 'nosniff',
+        'X-Frame-Options': 'DENY'
+    });
+    
     next();
 });
 
-// ========== CACHING SYSTEM ==========
+// ========== ENHANCED CACHING SYSTEM ==========
 const cache = new Map();
 const CACHE_DURATION = {
-    prices: 10 * 1000, // 10 seconds for prices
-    signals: 5 * 1000,  // 5 seconds for signals
-    statistics: 30 * 1000, // 30 seconds for statistics
-    history: 60 * 1000  // 1 minute for history
+    prices: 8 * 1000,      // 8 seconds (faster refresh)
+    signals: 3 * 1000,     // 3 seconds
+    statistics: 20 * 1000, // 20 seconds
+    history: 60 * 1000,    // 1 minute
+    health: 5 * 1000       // 5 seconds for health
 };
 
+// Persistent cache for fallback data
+const persistentCache = new Map();
+
 function getCacheKey(req) {
-    return `${req.method}:${req.path}:${JSON.stringify(req.query)}`;
+    const baseKey = `${req.method}:${req.path}`;
+    const queryKey = Object.keys(req.query).length > 0 ? `:${JSON.stringify(req.query)}` : '';
+    return baseKey + queryKey;
 }
 
 function getFromCache(key) {
@@ -44,10 +70,10 @@ function getFromCache(key) {
 }
 
 function setCache(key, data, duration) {
-    // Limit cache size to prevent memory issues
-    if (cache.size > 100) {
-        const firstKey = cache.keys().next().value;
-        cache.delete(firstKey);
+    // Aggressive cache management
+    if (cache.size > 50) { // Reduced from 100
+        const oldKeys = Array.from(cache.keys()).slice(0, 25);
+        oldKeys.forEach(k => cache.delete(k));
     }
     
     cache.set(key, {
@@ -55,27 +81,51 @@ function setCache(key, data, duration) {
         timestamp: Date.now(),
         duration
     });
+    
+    // Store in persistent cache for fallback
+    persistentCache.set(key, {
+        data,
+        timestamp: Date.now()
+    });
 }
 
-// Cache middleware
+// Enhanced cache middleware with fallback
 function cacheMiddleware(duration) {
     return (req, res, next) => {
         const cacheKey = getCacheKey(req);
         const cached = getFromCache(cacheKey);
         
         if (cached) {
+            res.set('X-Cache', 'HIT');
             return res.json(cached);
         }
         
-        // Override res.json to cache the response
         const originalJson = res.json;
+        const originalSend = res.send;
+        
         res.json = function(data) {
             if (res.statusCode === 200) {
                 setCache(cacheKey, data, duration);
+                res.set('X-Cache', 'MISS');
             }
             originalJson.call(this, data);
         };
         
+        // Timeout fallback
+        const timeoutId = setTimeout(() => {
+            const fallback = persistentCache.get(cacheKey);
+            if (fallback && !res.headersSent) {
+                res.set('X-Cache', 'STALE');
+                res.set('X-Data-Age', Math.floor((Date.now() - fallback.timestamp) / 1000));
+                return res.json({
+                    ...fallback.data,
+                    _stale: true,
+                    _age: Math.floor((Date.now() - fallback.timestamp) / 1000)
+                });
+            }
+        }, 6000); // 6-second fallback
+        
+        res.on('finish', () => clearTimeout(timeoutId));
         next();
     };
 }
@@ -84,11 +134,54 @@ function cacheMiddleware(duration) {
 const dbPath = path.join(__dirname, 'gold_tracker.db');
 const db = new sqlite3.Database(dbPath);
 
-// Configure SQLite for better performance
+// Enhanced SQLite performance
 db.run('PRAGMA journal_mode = WAL');
 db.run('PRAGMA synchronous = NORMAL');
-db.run('PRAGMA cache_size = 10000');
+db.run('PRAGMA cache_size = 20000'); // Increased cache
 db.run('PRAGMA temp_store = memory');
+db.run('PRAGMA mmap_size = 268435456'); // 256MB memory map
+db.run('PRAGMA optimize');
+
+// Connection pooling simulation
+let dbBusy = false;
+const dbQueue = [];
+
+function executeQuery(query, params = []) {
+    return new Promise((resolve, reject) => {
+        const task = { query, params, resolve, reject };
+        
+        if (dbBusy) {
+            dbQueue.push(task);
+            return;
+        }
+        
+        executeTask(task);
+    });
+}
+
+function executeTask(task) {
+    dbBusy = true;
+    const { query, params, resolve, reject } = task;
+    
+    const isSelect = query.trim().toUpperCase().startsWith('SELECT');
+    const method = isSelect ? 'all' : 'run';
+    
+    db[method](query, params, function(err, result) {
+        dbBusy = false;
+        
+        if (err) {
+            reject(err);
+        } else {
+            resolve(isSelect ? result : { changes: this.changes, lastID: this.lastID });
+        }
+        
+        // Process next in queue
+        if (dbQueue.length > 0) {
+            const nextTask = dbQueue.shift();
+            executeTask(nextTask);
+        }
+    });
+}
 
 // ========== GOLDAPI CONFIGURATION ==========
 const GOLDAPI_KEY = 'goldapi-75sa519mditl5es-io';
@@ -100,31 +193,72 @@ const metals = {
     'XPD': 'XPD/USD'
 };
 
-// Configure axios with timeouts and retries
+// Aggressive axios configuration for global users
 const axiosConfig = {
-    timeout: 10000, // 10 second timeout
+    timeout: 4000, // Reduced from 10s to 4s
     headers: {
         'x-access-token': GOLDAPI_KEY,
-        'Content-Type': 'application/json'
-    }
+        'Content-Type': 'application/json',
+        'Accept-Encoding': 'gzip, deflate',
+        'Connection': 'keep-alive'
+    },
+    maxRedirects: 2,
+    validateStatus: status => status < 500 // Accept 4xx as valid
 };
 
-// Helper functions
-function logWithTimestamp(message) {
-    const now = new Date();
-    const timestamp = now.toLocaleTimeString();
-    console.log(`${message} (${timestamp})`);
-}
+// Create axios instance with interceptors
+const goldApi = axios.create(axiosConfig);
 
-// Optimized price fetching with retries
-async function fetchMetalPrice(metalSymbol, retries = 2) {
+// Request interceptor for logging
+goldApi.interceptors.request.use(config => {
+    config.metadata = { startTime: Date.now() };
+    return config;
+});
+
+// Response interceptor for monitoring
+goldApi.interceptors.response.use(
+    response => {
+        const duration = Date.now() - response.config.metadata.startTime;
+        console.log(`✅ GoldAPI call: ${duration}ms`);
+        return response;
+    },
+    error => {
+        const duration = Date.now() - error.config.metadata.startTime;
+        console.log(`❌ GoldAPI failed: ${duration}ms - ${error.message}`);
+        return Promise.reject(error);
+    }
+);
+
+// Enhanced price fetching with circuit breaker
+let circuitBreakerState = 'CLOSED'; // CLOSED, OPEN, HALF_OPEN
+let failureCount = 0;
+let lastFailureTime = 0;
+const FAILURE_THRESHOLD = 3;
+const RECOVERY_TIMEOUT = 30000; // 30 seconds
+
+async function fetchMetalPrice(metalSymbol, retries = 1) {
     const endpoint = metals[metalSymbol];
     if (!endpoint) throw new Error(`Unsupported metal symbol: ${metalSymbol}`);
 
+    // Circuit breaker check
+    if (circuitBreakerState === 'OPEN') {
+        if (Date.now() - lastFailureTime > RECOVERY_TIMEOUT) {
+            circuitBreakerState = 'HALF_OPEN';
+        } else {
+            throw new Error('Circuit breaker is OPEN - API unavailable');
+        }
+    }
+
     for (let attempt = 0; attempt <= retries; attempt++) {
         try {
-            const response = await axios.get(`${GOLDAPI_BASE_URL}/${endpoint}`, axiosConfig);
+            const response = await goldApi.get(`${GOLDAPI_BASE_URL}/${endpoint}`);
             const data = response.data;
+            
+            // Reset circuit breaker on success
+            if (circuitBreakerState === 'HALF_OPEN') {
+                circuitBreakerState = 'CLOSED';
+                failureCount = 0;
+            }
             
             if (data.error) {
                 throw new Error(`GoldAPI Error: ${data.error}`);
@@ -138,7 +272,7 @@ async function fetchMetalPrice(metalSymbol, retries = 2) {
             const changePercent = ((change / previousClose) * 100);
 
             return {
-                price: Math.round(estimatedPrice * 100) / 100, // Round to 2 decimal places
+                price: Math.round(estimatedPrice * 100) / 100,
                 ask: Math.round(askPrice * 100) / 100,
                 bid: Math.round(bidPrice * 100) / 100,
                 change: Math.round(change * 100) / 100,
@@ -150,25 +284,32 @@ async function fetchMetalPrice(metalSymbol, retries = 2) {
                 prev_close_price: data.prev_close_price ? Math.round(data.prev_close_price * 100) / 100 : null
             };
         } catch (error) {
+            failureCount++;
+            
+            if (failureCount >= FAILURE_THRESHOLD) {
+                circuitBreakerState = 'OPEN';
+                lastFailureTime = Date.now();
+            }
+            
             if (attempt === retries) {
-                logWithTimestamp(`❌ Failed to fetch ${metalSymbol} after ${retries + 1} attempts: ${error.message}`);
                 throw error;
             }
-            await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1))); // Exponential backoff
+            await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)));
         }
     }
 }
 
-// Optimized price update with batch operations
+// Batch update with better error handling
 async function updateAllMetalPrices() {
-    logWithTimestamp('🔄 Starting optimized price update...');
+    const startTime = Date.now();
+    console.log('🔄 Starting price update...');
     
-    const updatePromises = Object.keys(metals).map(async (symbol) => {
-        try {
-            const priceData = await fetchMetalPrice(symbol);
-            
-            return new Promise((resolve, reject) => {
-                db.run(`
+    try {
+        const updatePromises = Object.keys(metals).map(async (symbol) => {
+            try {
+                const priceData = await fetchMetalPrice(symbol);
+                
+                await executeQuery(`
                     INSERT OR REPLACE INTO prices (
                         metal, price, ask_price, bid_price, change_24h, change_percent, 
                         high_24h, low_24h, open_price, prev_close_price, last_updated
@@ -177,23 +318,18 @@ async function updateAllMetalPrices() {
                     symbol, priceData.price, priceData.ask, priceData.bid, 
                     priceData.change, priceData.changePercent, priceData.high_24h,
                     priceData.low_24h, priceData.open_price, priceData.prev_close_price
-                ], (err) => {
-                    if (err) {
-                        reject(err);
-                    } else {
-                        resolve(symbol);
-                    }
-                });
-            });
-        } catch (error) {
-            logWithTimestamp(`❌ Error updating ${symbol}: ${error.message}`);
-            return null;
-        }
-    });
+                ]);
+                
+                return symbol;
+            } catch (error) {
+                console.log(`❌ Error updating ${symbol}: ${error.message}`);
+                return null;
+            }
+        });
 
-    try {
         await Promise.allSettled(updatePromises);
-        // Clear price cache after update
+        
+        // Clear only price-related cache
         const keysToDelete = [];
         for (const [key] of cache.entries()) {
             if (key.includes('/api/prices')) {
@@ -202,15 +338,17 @@ async function updateAllMetalPrices() {
         }
         keysToDelete.forEach(key => cache.delete(key));
         
-        logWithTimestamp('✅ Batch price update completed');
+        const duration = Date.now() - startTime;
+        console.log(`✅ Price update completed in ${duration}ms`);
+        
     } catch (error) {
-        logWithTimestamp(`❌ Batch update error: ${error.message}`);
+        console.log(`❌ Batch update error: ${error.message}`);
     }
 }
 
 // ========== DATABASE INITIALIZATION ==========
 db.serialize(() => {
-    // Create tables with proper indexes
+    // Create tables with optimized indexes
     db.run(`CREATE TABLE IF NOT EXISTS prices (
         metal TEXT PRIMARY KEY,
         price REAL NOT NULL,
@@ -245,10 +383,9 @@ db.serialize(() => {
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
 
-    // Create indexes for better query performance
-    db.run('CREATE INDEX IF NOT EXISTS idx_signals_active ON signals(active)');
-    db.run('CREATE INDEX IF NOT EXISTS idx_signals_symbol ON signals(symbol)');
-    db.run('CREATE INDEX IF NOT EXISTS idx_signals_created ON signals(created_at DESC)');
+    // Optimized indexes
+    db.run('CREATE INDEX IF NOT EXISTS idx_signals_active_created ON signals(active, created_at DESC)');
+    db.run('CREATE INDEX IF NOT EXISTS idx_signals_symbol_active ON signals(symbol, active)');
 
     db.run(`CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -283,10 +420,9 @@ db.serialize(() => {
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
 
-    db.run('CREATE INDEX IF NOT EXISTS idx_trade_history_created ON trade_history(created_at DESC)');
-    db.run('CREATE INDEX IF NOT EXISTS idx_trade_history_symbol ON trade_history(symbol)');
+    db.run('CREATE INDEX IF NOT EXISTS idx_trade_history_created_symbol ON trade_history(created_at DESC, symbol)');
 
-    // Initialize statistics
+    // Initialize statistics if not exists
     db.get('SELECT COUNT(*) as count FROM trade_statistics', [], (err, row) => {
         if (!err && row.count === 0) {
             db.run(`INSERT INTO trade_statistics (total_trades, win_trades, lose_trades, total_profit, win_rate) 
@@ -295,47 +431,65 @@ db.serialize(() => {
     });
 });
 
-// Start optimized price updates
-logWithTimestamp('🚀 Starting optimized price monitoring...');
+// Start price updates with better scheduling
+console.log('🚀 Starting price monitoring...');
 updateAllMetalPrices();
-setInterval(updateAllMetalPrices, 15 * 1000);
+setInterval(updateAllMetalPrices, 10 * 1000); // Every 10 seconds
 
 // ========== OPTIMIZED ROUTES ==========
 
-// Lightweight price endpoint with minimal data
-app.get('/api/prices/light', cacheMiddleware(CACHE_DURATION.prices), (req, res) => {
-    db.all(`
-        SELECT metal, price, change_percent, last_updated 
-        FROM prices 
-        ORDER BY metal
-    `, [], (err, rows) => {
-        if (err) {
-            return res.status(500).json({ error: 'Database error' });
-        }
+// Ultra-lightweight price endpoint
+app.get('/api/prices/ultra-light', cacheMiddleware(CACHE_DURATION.prices), async (req, res) => {
+    try {
+        const rows = await executeQuery('SELECT metal, price, change_percent FROM prices ORDER BY metal');
+        
+        const prices = {};
+        rows.forEach(row => {
+            prices[row.metal] = [row.price, row.change_percent]; // Array format for minimal payload
+        });
+
+        res.json({
+            t: Date.now(),
+            d: prices
+        });
+    } catch (err) {
+        res.status(500).json({ error: 'Database error' });
+    }
+});
+
+// Enhanced light price endpoint
+app.get('/api/prices/light', cacheMiddleware(CACHE_DURATION.prices), async (req, res) => {
+    try {
+        const rows = await executeQuery(`
+            SELECT metal, price, change_percent, last_updated 
+            FROM prices 
+            ORDER BY metal
+        `);
 
         const lightPrices = {};
         rows.forEach(row => {
             lightPrices[row.metal] = {
-                p: row.price, // Short property names to reduce payload
+                p: row.price,
                 c: row.change_percent,
                 u: row.last_updated
             };
         });
 
         res.json({
-            s: true, // success
-            t: Date.now(), // timestamp
-            d: lightPrices // data
+            s: true,
+            t: Date.now(),
+            d: lightPrices,
+            cb: circuitBreakerState // Circuit breaker status
         });
-    });
+    } catch (err) {
+        res.status(500).json({ error: 'Database error' });
+    }
 });
 
-// Full price endpoint with caching
-app.get('/api/prices', cacheMiddleware(CACHE_DURATION.prices), (req, res) => {
-    db.all('SELECT * FROM prices ORDER BY metal', [], (err, rows) => {
-        if (err) {
-            return res.status(500).json({ error: 'Database error' });
-        }
+// Full price endpoint with enhanced caching
+app.get('/api/prices', cacheMiddleware(CACHE_DURATION.prices), async (req, res) => {
+    try {
+        const rows = await executeQuery('SELECT * FROM prices ORDER BY metal');
 
         const prices = {};
         rows.forEach(row => {
@@ -357,54 +511,52 @@ app.get('/api/prices', cacheMiddleware(CACHE_DURATION.prices), (req, res) => {
             success: true,
             timestamp: Date.now(),
             prices,
-            source: 'GoldAPI.io'
+            source: 'GoldAPI.io',
+            circuit_breaker: circuitBreakerState
         });
-    });
-});
-
-// Optimized signals endpoint with pagination
-app.get('/api/signals', cacheMiddleware(CACHE_DURATION.signals), (req, res) => {
-    const { page = 1, limit = 20, active_only = 'false' } = req.query;
-    const offset = (parseInt(page) - 1) * parseInt(limit);
-    
-    let query = 'SELECT * FROM signals';
-    let countQuery = 'SELECT COUNT(*) as total FROM signals';
-    const params = [];
-    
-    if (active_only === 'true') {
-        query += ' WHERE active = 1';
-        countQuery += ' WHERE active = 1';
+    } catch (err) {
+        res.status(500).json({ error: 'Database error' });
     }
-    
-    query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
-    params.push(parseInt(limit), offset);
-
-    db.get(countQuery, [], (err, countRow) => {
-        if (err) {
-            return res.status(500).json({ error: 'Database error' });
-        }
-
-        db.all(query, params, (err, rows) => {
-            if (err) {
-                return res.status(500).json({ error: 'Database error' });
-            }
-
-            res.json({
-                success: true,
-                signals: rows,
-                pagination: {
-                    page: parseInt(page),
-                    limit: parseInt(limit),
-                    total: countRow.total,
-                    pages: Math.ceil(countRow.total / parseInt(limit))
-                },
-                timestamp: Date.now()
-            });
-        });
-    });
 });
 
-// Optimized single metal price
+// Optimized signals with better pagination
+app.get('/api/signals', cacheMiddleware(CACHE_DURATION.signals), async (req, res) => {
+    try {
+        const { page = 1, limit = 20, active_only = 'false' } = req.query;
+        const offset = (parseInt(page) - 1) * parseInt(limit);
+        
+        let query = 'SELECT * FROM signals';
+        let countQuery = 'SELECT COUNT(*) as total FROM signals';
+        
+        if (active_only === 'true') {
+            query += ' WHERE active = 1';
+            countQuery += ' WHERE active = 1';
+        }
+        
+        query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
+
+        const [countResult, rows] = await Promise.all([
+            executeQuery(countQuery),
+            executeQuery(query, [parseInt(limit), offset])
+        ]);
+
+        res.json({
+            success: true,
+            signals: rows,
+            pagination: {
+                page: parseInt(page),
+                limit: parseInt(limit),
+                total: countResult[0].total,
+                pages: Math.ceil(countResult[0].total / parseInt(limit))
+            },
+            timestamp: Date.now()
+        });
+    } catch (err) {
+        res.status(500).json({ error: 'Database error' });
+    }
+});
+
+// Optimized single metal price with fallback
 app.get('/api/metals/:symbol/price', cacheMiddleware(CACHE_DURATION.prices), async (req, res) => {
     try {
         const { symbol } = req.params;
@@ -415,14 +567,37 @@ app.get('/api/metals/:symbol/price', cacheMiddleware(CACHE_DURATION.prices), asy
             });
         }
 
-        // Try database first (faster)
-        db.get('SELECT * FROM prices WHERE metal = ?', [symbol], async (err, row) => {
-            if (err) {
-                return res.status(500).json({ error: 'Database error' });
-            }
+        // Try database first
+        const rows = await executeQuery('SELECT * FROM prices WHERE metal = ?', [symbol]);
+        const row = rows[0];
 
-            if (row && (Date.now() - new Date(row.last_updated).getTime()) < 30000) {
-                // Data is less than 30 seconds old, return it
+        if (row && (Date.now() - new Date(row.last_updated).getTime()) < 20000) {
+            return res.json({
+                success: true,
+                symbol,
+                price: row.price,
+                ask: row.ask_price,
+                bid: row.bid_price,
+                change: row.change_24h,
+                changePercent: row.change_percent,
+                timestamp: Date.now(),
+                source: 'cached'
+            });
+        }
+
+        // Try to fetch fresh data
+        try {
+            const data = await fetchMetalPrice(symbol);
+            res.json({
+                success: true,
+                symbol,
+                ...data,
+                timestamp: Date.now(),
+                source: 'live'
+            });
+        } catch (fetchError) {
+            // Fallback to any cached data
+            if (row) {
                 return res.json({
                     success: true,
                     symbol,
@@ -432,39 +607,12 @@ app.get('/api/metals/:symbol/price', cacheMiddleware(CACHE_DURATION.prices), asy
                     change: row.change_24h,
                     changePercent: row.change_percent,
                     timestamp: Date.now(),
-                    source: 'cached'
+                    source: 'fallback',
+                    warning: 'Live data unavailable'
                 });
-            } else {
-                // Fetch fresh data
-                try {
-                    const data = await fetchMetalPrice(symbol);
-                    res.json({
-                        success: true,
-                        symbol,
-                        ...data,
-                        timestamp: Date.now(),
-                        source: 'live'
-                    });
-                } catch (fetchError) {
-                    // Fallback to cached data even if old
-                    if (row) {
-                        return res.json({
-                            success: true,
-                            symbol,
-                            price: row.price,
-                            ask: row.ask_price,
-                            bid: row.bid_price,
-                            change: row.change_24h,
-                            changePercent: row.change_percent,
-                            timestamp: Date.now(),
-                            source: 'fallback',
-                            warning: 'Live data unavailable, showing cached data'
-                        });
-                    }
-                    throw fetchError;
-                }
             }
-        });
+            throw fetchError;
+        }
     } catch (err) {
         res.status(500).json({ 
             error: err.message,
@@ -473,19 +621,17 @@ app.get('/api/metals/:symbol/price', cacheMiddleware(CACHE_DURATION.prices), asy
     }
 });
 
-// Optimized statistics endpoint
-app.get('/api/statistics', cacheMiddleware(CACHE_DURATION.statistics), (req, res) => {
-    db.get(`
-        SELECT total_trades, win_trades, lose_trades, total_profit, win_rate, last_updated 
-        FROM trade_statistics 
-        ORDER BY last_updated DESC 
-        LIMIT 1
-    `, [], (err, row) => {
-        if (err) {
-            return res.status(500).json({ error: 'Database error' });
-        }
+// Enhanced statistics endpoint
+app.get('/api/statistics', cacheMiddleware(CACHE_DURATION.statistics), async (req, res) => {
+    try {
+        const rows = await executeQuery(`
+            SELECT total_trades, win_trades, lose_trades, total_profit, win_rate, last_updated 
+            FROM trade_statistics 
+            ORDER BY last_updated DESC 
+            LIMIT 1
+        `);
 
-        const stats = row || {
+        const stats = rows[0] || {
             total_trades: 0,
             win_trades: 0,
             lose_trades: 0,
@@ -499,84 +645,87 @@ app.get('/api/statistics', cacheMiddleware(CACHE_DURATION.statistics), (req, res
             statistics: stats,
             timestamp: Date.now()
         });
-    });
-});
-
-// Optimized trade history with pagination
-app.get('/api/statistics/history', cacheMiddleware(CACHE_DURATION.history), (req, res) => {
-    const { limit = 20, offset = 0, symbol } = req.query;
-    
-    let query = `
-        SELECT id, symbol, trade_type, entry_price, exit_price, 
-               percentage_change, result, pips, created_at 
-        FROM trade_history
-    `;
-    let countQuery = 'SELECT COUNT(*) as total FROM trade_history';
-    const params = [];
-    
-    if (symbol) {
-        query += ' WHERE symbol = ?';
-        countQuery += ' WHERE symbol = ?';
-        params.push(symbol);
+    } catch (err) {
+        res.status(500).json({ error: 'Database error' });
     }
-    
-    query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
-    
-    db.get(countQuery, symbol ? [symbol] : [], (err, countRow) => {
-        if (err) {
-            return res.status(500).json({ error: 'Database error' });
-        }
-
-        db.all(query, [...params, parseInt(limit), parseInt(offset)], (err, rows) => {
-            if (err) {
-                return res.status(500).json({ error: 'Database error' });
-            }
-
-            res.json({
-                success: true,
-                history: rows,
-                count: rows.length,
-                total: countRow.total,
-                timestamp: Date.now()
-            });
-        });
-    });
 });
 
-// Health check with quick response
-app.get('/api/health', (req, res) => {
+// Optimized trade history
+app.get('/api/statistics/history', cacheMiddleware(CACHE_DURATION.history), async (req, res) => {
+    try {
+        const { limit = 20, offset = 0, symbol } = req.query;
+        
+        let query = `
+            SELECT id, symbol, trade_type, entry_price, exit_price, 
+                   percentage_change, result, pips, created_at 
+            FROM trade_history
+        `;
+        let countQuery = 'SELECT COUNT(*) as total FROM trade_history';
+        let params = [];
+        
+        if (symbol) {
+            query += ' WHERE symbol = ?';
+            countQuery += ' WHERE symbol = ?';
+            params.push(symbol);
+        }
+        
+        query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
+        
+        const [countResult, rows] = await Promise.all([
+            executeQuery(countQuery, symbol ? [symbol] : []),
+            executeQuery(query, [...params, parseInt(limit), parseInt(offset)])
+        ]);
+
+        res.json({
+            success: true,
+            history: rows,
+            count: rows.length,
+            total: countResult[0].total,
+            timestamp: Date.now()
+        });
+    } catch (err) {
+        res.status(500).json({ error: 'Database error' });
+    }
+});
+
+// Enhanced health check
+app.get('/api/health', cacheMiddleware(CACHE_DURATION.health), (req, res) => {
     res.json({
         status: 'healthy',
         timestamp: Date.now(),
         cache_size: cache.size,
-        uptime: process.uptime()
+        persistent_cache_size: persistentCache.size,
+        circuit_breaker: circuitBreakerState,
+        uptime: Math.floor(process.uptime()),
+        memory: {
+            used: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+            total: Math.round(process.memoryUsage().heapTotal / 1024 / 1024)
+        }
     });
 });
 
-// Add new signal (optimized)
-app.post('/api/signals', (req, res) => {
-    const {
-        symbol, trade_type, entry_price, target1, target2, target3, stoploss, send_notifications
-    } = req.body;
+// Enhanced signal creation
+app.post('/api/signals', async (req, res) => {
+    try {
+        const {
+            symbol, trade_type, entry_price, target1, target2, target3, stoploss, send_notifications
+        } = req.body;
 
-    if (!symbol || !trade_type || !entry_price || !stoploss) {
-        return res.status(400).json({
-            error: 'Missing required fields'
-        });
-    }
-
-    db.run(`
-        INSERT INTO signals (
-            symbol, trade_type, entry_price, target1, target2, target3, 
-            stoploss, send_notifications, current_price, percentage_change
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `, [
-        symbol, trade_type, entry_price, target1 || null, target2 || null, 
-        target3 || null, stoploss, send_notifications !== false, entry_price, 0.0
-    ], function(err) {
-        if (err) {
-            return res.status(500).json({ error: 'Failed to add signal' });
+        if (!symbol || !trade_type || !entry_price || !stoploss) {
+            return res.status(400).json({
+                error: 'Missing required fields'
+            });
         }
+
+        const result = await executeQuery(`
+            INSERT INTO signals (
+                symbol, trade_type, entry_price, target1, target2, target3, 
+                stoploss, send_notifications, current_price, percentage_change
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `, [
+            symbol, trade_type, entry_price, target1 || null, target2 || null, 
+            target3 || null, stoploss, send_notifications !== false, entry_price, 0.0
+        ]);
 
         // Clear signals cache
         const keysToDelete = [];
@@ -589,41 +738,41 @@ app.post('/api/signals', (req, res) => {
 
         res.json({
             success: true,
-            signal_id: this.lastID,
+            signal_id: result.lastID,
             timestamp: Date.now()
         });
-    });
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to add signal' });
+    }
 });
 
-// Update signal (optimized)
-app.put('/api/signals/:id', (req, res) => {
-    const signalId = req.params.id;
-    const updates = req.body;
-    
-    const allowedFields = ['target1_hit', 'target2_hit', 'target3_hit', 'active', 'current_price', 'percentage_change'];
-    const setClause = [];
-    const values = [];
-    
-    for (const field of allowedFields) {
-        if (updates[field] !== undefined) {
-            setClause.push(`${field} = ?`);
-            values.push(updates[field]);
+// Enhanced signal update
+app.put('/api/signals/:id', async (req, res) => {
+    try {
+        const signalId = req.params.id;
+        const updates = req.body;
+        
+        const allowedFields = ['target1_hit', 'target2_hit', 'target3_hit', 'active', 'current_price', 'percentage_change'];
+        const setClause = [];
+        const values = [];
+        
+        for (const field of allowedFields) {
+            if (updates[field] !== undefined) {
+                setClause.push(`${field} = ?`);
+                values.push(updates[field]);
+            }
         }
-    }
-    
-    if (setClause.length === 0) {
-        return res.status(400).json({ error: 'No valid fields to update' });
-    }
-    
-    setClause.push('updated_at = CURRENT_TIMESTAMP');
-    values.push(signalId);
-
-    db.run(`UPDATE signals SET ${setClause.join(', ')} WHERE id = ?`, values, function(err) {
-        if (err) {
-            return res.status(500).json({ error: 'Failed to update signal' });
+        
+        if (setClause.length === 0) {
+            return res.status(400).json({ error: 'No valid fields to update' });
         }
+        
+        setClause.push('updated_at = CURRENT_TIMESTAMP');
+        values.push(signalId);
 
-        if (this.changes === 0) {
+        const result = await executeQuery(`UPDATE signals SET ${setClause.join(', ')} WHERE id = ?`, values);
+
+        if (result.changes === 0) {
             return res.status(404).json({ error: 'Signal not found' });
         }
 
@@ -632,19 +781,37 @@ app.put('/api/signals/:id', (req, res) => {
 
         res.json({
             success: true,
-            changes: this.changes,
+            changes: result.changes,
             timestamp: Date.now()
         });
-    });
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to update signal' });
+    }
 });
 
 // Error handling middleware
 app.use((err, req, res, next) => {
     console.error('❌ Unhandled error:', err);
-    res.status(500).json({ 
-        error: 'Internal server error',
-        timestamp: Date.now()
-    });
+    
+    // Try to send cached data if available
+    const cacheKey = getCacheKey(req);
+    const fallback = persistentCache.get(cacheKey);
+    
+    if (fallback && !res.headersSent) {
+        res.set('X-Cache', 'ERROR_FALLBACK');
+        return res.json({
+            ...fallback.data,
+            _error_fallback: true,
+            _age: Math.floor((Date.now() - fallback.timestamp) / 1000)
+        });
+    }
+    
+    if (!res.headersSent) {
+        res.status(500).json({ 
+            error: 'Internal server error',
+            timestamp: Date.now()
+        });
+    }
 });
 
 // 404 handler
@@ -657,15 +824,16 @@ app.use((req, res) => {
 
 // ========== START SERVER ==========
 app.listen(PORT, '0.0.0.0', () => {
-    console.log('🚀 Optimized Gold Tracker API Server Started');
+    console.log('🚀 Enhanced Gold Tracker API Server Started');
     console.log(`🌐 Server: http://0.0.0.0:${PORT}`);
-    console.log('⚡ Optimizations enabled:');
-    console.log('   📦 GZIP compression');
-    console.log('   ⚡ Response caching');
-    console.log('   🔍 Database indexing');
-    console.log('   📱 Lightweight endpoints');
-    console.log('   📄 Request pagination');
-    console.log('   ⏱️ Connection timeouts');
+    console.log('⚡ Global Optimizations:');
+    console.log('   🔄 Circuit breaker pattern');
+    console.log('   📦 Enhanced compression');
+    console.log('   ⚡ Aggressive caching');
+    console.log('   🗄️ Connection pooling');
+    console.log('   📱 Ultra-light endpoints');
+    console.log('   🛡️ Fallback mechanisms');
+    console.log('   ⏱️ Reduced timeouts');
     console.log('   🔄 Retry mechanisms');
     console.log('\n📡 New optimized endpoints:');
     console.log('   GET  /api/prices/light - Minimal price data');
