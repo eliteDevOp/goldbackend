@@ -69,21 +69,21 @@ function executeQuery(query, params = []) {
     });
 }
 
-// ========== GOLDAPI CONFIGURATION ==========
-const GOLDAPI_KEY = 'goldapi-75sa519mditl5es-io';
-const GOLDAPI_BASE_URL = 'https://www.goldapi.io/api';
+// ========== GOLD-API CONFIGURATION ==========
+// New API: https://api.gold-api.com — No authentication required, no rate limits
+// Important: Cache prices for at least 1 minute to avoid IP block
+const GOLDAPI_BASE_URL = 'https://api.gold-api.com/price';
 const metals = {
-    'XAU': 'XAU/USD',
-    'XAG': 'XAG/USD',
-    'XPT': 'XPT/USD',
-    'XPD': 'XPD/USD'
+    'XAU': 'XAU',
+    'XAG': 'XAG',
+    'XPT': 'XPT',
+    'XPD': 'XPD'
 };
 
-// Axios configuration
+// Axios configuration (no auth header needed for new API)
 const axiosConfig = {
     timeout: 6000,
     headers: {
-        'x-access-token': GOLDAPI_KEY,
         'Content-Type': 'application/json',
         'Accept-Encoding': 'gzip, deflate',
         'Connection': 'keep-alive'
@@ -102,8 +102,7 @@ const FAILURE_THRESHOLD = 3;
 const RECOVERY_TIMEOUT = 30000;
 
 async function fetchMetalPrice(metalSymbol, retries = 1) {
-    const endpoint = metals[metalSymbol];
-    if (!endpoint) throw new Error(`Unsupported metal symbol: ${metalSymbol}`);
+    if (!metals[metalSymbol]) throw new Error(`Unsupported metal symbol: ${metalSymbol}`);
 
     if (circuitBreakerState === 'OPEN') {
         if (Date.now() - lastFailureTime > RECOVERY_TIMEOUT) {
@@ -115,36 +114,33 @@ async function fetchMetalPrice(metalSymbol, retries = 1) {
 
     for (let attempt = 0; attempt <= retries; attempt++) {
         try {
-            const response = await goldApi.get(`${GOLDAPI_BASE_URL}/${endpoint}`);
+            // New API endpoint: GET https://api.gold-api.com/price/{symbol}
+            const response = await goldApi.get(`${GOLDAPI_BASE_URL}/${metalSymbol}`);
             const data = response.data;
-            
+
             if (circuitBreakerState === 'HALF_OPEN') {
                 circuitBreakerState = 'CLOSED';
                 failureCount = 0;
             }
-            
-            if (data.error) {
-                throw new Error(`GoldAPI Error: ${data.error}`);
+
+            if (!data || !data.price) {
+                throw new Error(`Invalid response from API for ${metalSymbol}`);
             }
 
-            const askPrice = data.ask || data.price;
-            const bidPrice = data.bid || data.price;
-            const estimatedPrice = (askPrice + bidPrice) / 2;
-            const previousClose = data.prev_close_price || estimatedPrice;
-            const change = estimatedPrice - previousClose;
-            const changePercent = ((change / previousClose) * 100);
+            // New API response fields: name, price, symbol, updatedAt, updatedAtReadable
+            const price = data.price;
 
             return {
-                price: Math.round(estimatedPrice * 100) / 100,
-                ask: Math.round(askPrice * 100) / 100,
-                bid: Math.round(bidPrice * 100) / 100,
-                change: Math.round(change * 100) / 100,
-                changePercent: Math.round(changePercent * 100) / 100,
-                timestamp: data.timestamp || Date.now(),
-                high_24h: data.high_24h ? Math.round(data.high_24h * 100) / 100 : null,
-                low_24h: data.low_24h ? Math.round(data.low_24h * 100) / 100 : null,
-                open_price: data.open_price ? Math.round(data.open_price * 100) / 100 : null,
-                prev_close_price: data.prev_close_price ? Math.round(data.prev_close_price * 100) / 100 : null
+                price: Math.round(price * 100) / 100,
+                ask: Math.round(price * 100) / 100,
+                bid: Math.round(price * 100) / 100,
+                change: 0,
+                changePercent: 0,
+                timestamp: data.updatedAt ? new Date(data.updatedAt).getTime() : Date.now(),
+                high_24h: null,
+                low_24h: null,
+                open_price: null,
+                prev_close_price: null
             };
         } catch (error) {
             failureCount++;
@@ -236,7 +232,6 @@ db.serialize(() => {
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
 
-    // Optimized indexes for faster signal queries
     db.run('CREATE INDEX IF NOT EXISTS idx_signals_active_created ON signals(active, created_at DESC)');
     db.run('CREATE INDEX IF NOT EXISTS idx_signals_symbol_active ON signals(symbol, active)');
     db.run('CREATE INDEX IF NOT EXISTS idx_signals_created ON signals(created_at DESC)');
@@ -276,7 +271,6 @@ db.serialize(() => {
 
     db.run('CREATE INDEX IF NOT EXISTS idx_trade_history_created_symbol ON trade_history(created_at DESC, symbol)');
 
-    // Initialize statistics if not exists
     db.get('SELECT COUNT(*) as count FROM trade_statistics', [], (err, row) => {
         if (!err && row.count === 0) {
             db.run(`INSERT INTO trade_statistics (total_trades, win_trades, lose_trades, total_profit, win_rate) 
@@ -286,9 +280,11 @@ db.serialize(() => {
 });
 
 // Start price updates
+// NOTE: New API recommends caching for 1 minute minimum to avoid IP block
+// Interval set to 60 seconds (was 12 seconds with old API)
 console.log('🚀 Starting price monitoring...');
 updateAllMetalPrices();
-setInterval(updateAllMetalPrices, 12 * 1000); // Every 12 seconds
+setInterval(updateAllMetalPrices, 60 * 1000); // Every 60 seconds (respect new API guidelines)
 
 // ========== API ROUTES ==========
 
@@ -321,7 +317,7 @@ app.get('/api/prices', async (req, res) => {
             success: true,
             timestamp: Date.now(),
             prices,
-            source: 'GoldAPI.io',
+            source: 'gold-api.com',
             circuit_breaker: circuitBreakerState
         });
     } catch (err) {
@@ -330,12 +326,10 @@ app.get('/api/prices', async (req, res) => {
     }
 });
 
-// OPTIMIZED SIGNALS ENDPOINT - No caching, no pagination
+// OPTIMIZED SIGNALS ENDPOINT
 app.get('/api/signals', async (req, res) => {
     try {
         const startTime = Date.now();
-        
-        // Simple query with optimized fields selection
         const { active_only = 'false' } = req.query;
         
         let query = `
@@ -351,7 +345,6 @@ app.get('/api/signals', async (req, res) => {
             query += ' WHERE active = 1';
         }
         
-        // Order by most recent first with limit for mobile performance
         query += ' ORDER BY created_at DESC LIMIT 100';
 
         const rows = await executeQuery(query, params);
@@ -423,7 +416,6 @@ app.get('/api/metals/:symbol/price', async (req, res) => {
                 last_updated: row.last_updated
             });
         } else {
-            // Try to fetch fresh data
             try {
                 const data = await fetchMetalPrice(symbol);
                 res.json({
@@ -620,19 +612,18 @@ app.use((req, res) => {
 
 // ========== START SERVER ==========
 app.listen(PORT, '0.0.0.0', () => {
-    console.log('🚀 Simplified Gold Tracker API Server Started');
+    console.log('🚀 Gold Tracker API Server Started');
     console.log(`🌐 Server: http://0.0.0.0:${PORT}`);
-    console.log('⚡ Optimizations:');
-    console.log('   🗄️ Enhanced database indexes');
-    console.log('   📱 Simplified signal loading');
-    console.log('   ⚡ No caching overhead');
-    console.log('   📊 Direct database queries');
-    console.log('   🛡️ Circuit breaker for API calls');
-    console.log('   ⏱️ Response time tracking');
+    console.log('⚡ API: gold-api.com (no auth required)');
+    console.log('⏱️  Price update interval: 60 seconds');
     console.log('\n📡 Available endpoints:');
     console.log('   GET  /api/signals - All signals (up to 100)');
     console.log('   GET  /api/signals?active_only=true - Active signals only');
     console.log('   GET  /api/prices - All metal prices');
+    console.log('   GET  /api/metals/:symbol/price - Single metal price');
+    console.log('   GET  /api/statistics - Trade statistics');
+    console.log('   GET  /api/statistics/history - Trade history');
+    console.log('   GET  /api/health - Health check');
     console.log('   POST /api/signals - Create new signal');
     console.log('   PUT  /api/signals/:id - Update signal');
 });
